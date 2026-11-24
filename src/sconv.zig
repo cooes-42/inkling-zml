@@ -29,8 +29,8 @@ pub fn convolve(
     const c = cur.dim(.c);
     const s = cur.dim(.s);
 
-    var past = st.atVisit(v).sliceChannels(offset, c); // {.k = kernel-1, .c}
-    const cur_t = cur.transpose(.{ .c, .s }).rename(.{ .c = .c, .s = .t }); // {.c, .t=s}
+    var past = st.atVisit(v).sliceChannels(offset, c).rename(.{ .mix = .c }); // {.k = kernel-1, .c}
+    const cur_t = cur.rename(.{ .s = .t }); // {.t=s, .c}
     past = past.rename(.{ .k = .t }); // {.t = kernel-1, .c}
     const x = zml.Tensor.concatenate(&.{ past, cur_t }, .t); // {.t = kernel-1+s, .c}
 
@@ -39,7 +39,8 @@ pub fn convolve(
     for (0..@intCast(kernel)) |lag_usize| {
         const lag: i64 = @intCast(lag_usize);
         const win = x.slice(.t, .{ .start = lag, .end = lag + s }); // {.s, .c}
-        const w = weight.slice(.kernel, .{ .start = lag, .end = lag + 1 }).squeeze(.kernel); // {.c}
+        const w = weight.slice(.kernel, .{ .start = lag, .end = lag + 1 }).squeeze(.kernel)
+            .rename(.{ .d_kv = .c }).convert(cur.dtype()); // {.c}
         const term = win.mul(w.broad(win.shape()));
         out = if (lag == 0) term else out.add(term);
     }
@@ -59,7 +60,7 @@ pub fn convolve(
     }
 
     // nouvel état récurrent : derniers kernel-1 pas de x
-    const new_past = x.slice(.t, .{ .start = s, .end = s + kernel - 1 }); // {.k, .c}
+    const new_past = x.slice(.t, .{ .start = s, .end = s + kernel - 1 }).rename(.{ .t = .k, .c = .mix }); // {.k, .mix}
     const new_state = st.atVisit(v).updateChannels(offset, c, new_past);
 
     const dyn_factor: i64 = if (dynamic != null) 2 else 1;

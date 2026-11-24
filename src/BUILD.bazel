@@ -83,6 +83,16 @@ zig_binary(
     ],
 )
 
+zig_test(
+    name = "inkling2_test",
+    srcs = ["inkling2_test.zig"],
+    main = "inkling2_test.zig",
+    deps = [
+        ":inkling2",
+        ":zml",
+    ],
+)
+
 zig_binary(
     name = "inkling",
     srcs = ["main.zig"],

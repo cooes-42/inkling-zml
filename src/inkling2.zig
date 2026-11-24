@@ -57,15 +57,18 @@ pub const Config = struct {
     }
 };
 
-/// Visite v (0..47) -> couche physique (0..23).
-pub fn visitPhys(v: u32) u32 {
-    if (v < 24) return v;
-    return 6 + (v - 24) % 12;
+/// Visite v (0..n_visits-1) -> couche physique.
+pub fn visitPhys(cfg: Config, v: u32) u32 {
+    if (v < cfg.n_layers_phys) return v;
+    const core = cfg.loop_end - cfg.loop_start;
+    return cfg.loop_start + (v - cfg.n_layers_phys) % core;
 }
 
-/// Visite v -> passe de boucle (0 = prelude 0..23, 1/2 = replays du core 6..17).
-pub fn visitPass(v: u32) u32 {
-    return if (v < 24) 0 else 1 + (v - 24) / 12;
+/// Visite v -> passe de boucle (0 = prelude, 1.. = replays du core).
+pub fn visitPass(cfg: Config, v: u32) u32 {
+    if (v < cfg.n_layers_phys) return 0;
+    const core = cfg.loop_end - cfg.loop_start;
+    return 1 + (v - cfg.n_layers_phys) / core;
 }
 
 pub const Model = struct {
@@ -324,7 +327,7 @@ pub const SconvState = struct {
     pub fn updateChannels(self: SconvState, off: i64, len: i64, new_vals: zml.Tensor) SconvState {
         return .{
             .state = self.state.scatterSlices(
-                .{ .layer = self.layer_index, .mix = zml.Tensor.arange(.{ .start = off, .end = off + len }, .i64).withTags(.{.mix}) },
+                .{ .layer = self.layer_index, .mix = zml.Tensor.arange(.{ .start = off, .end = off + len }, .u32).withTags(.{.mix}) },
                 new_vals,
                 .{ .update_fn = zml.Tensor.ScatterOpts.override },
             ).reuseBuffer(self.state),
@@ -387,7 +390,7 @@ pub const VisitOut = struct {
 /// `msgs` : {.ctrl=4, .s, .d} présents uniquement pour les passes 1/2 des couches 6..17.
 pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml.Tensor) VisitOut {
     const cfg = m.config;
-    const phys = visitPhys(v);
+    const phys = visitPhys(cfg, v);
     const L = m.layers[phys];
     const global = L.is_global;
     const h = cfg.h;
@@ -450,10 +453,10 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
     var V = vc.out.splitAxis(.c, .{ .h = hkv, .hd = hd });
 
     // 5. clips + value norm + log-scale (globales)
-    Q = l2clip(Q.mul(L.q_clip.broad(Q.shape())), cfg.qk_clip, .hd);
+    Q = l2clip(Q.mul(L.q_clip.convert(Q.dtype()).broad(Q.shape())), cfg.qk_clip, .hd);
     K = l2clip(K, cfg.qk_clip, .hd);
     V = zml.nn.rmsNorm(V.convert(.f32), .hd, cfg.rms_eps).convert(V.dtype());
-    R = l2clip(R.mul(L.rel_clip.broad(R.shape())), cfg.rel_clip, .d_rel);
+    R = l2clip(R.mul(L.rel_clip.convert(R.dtype()).broad(R.shape())), cfg.rel_clip, .d_rel);
     if (global) {
         const tau = ctx.pos.convert(.f32).addConstant(1).scale(1.0 / cfg.log_scale_floor)
             .maximum(zml.Tensor.scalar(1.0, .f32)).log().scale(cfg.log_scale_alpha).addConstant(1); // {.s}
@@ -625,4 +628,88 @@ pub fn forward(m: Model, tokens: zml.Tensor, pos: zml.Tensor, token_index: zml.T
     logits = logits.slice(.voc, .{ .start = 0, .end = cfg.vocab_unpadded }).convert(.f32);
 
     return .{ .logits = logits, .kv = ctx.kv, .sconv = ctx.sconv };
+}
+
+// ---------------------------------------------------------------------------
+// Constructeur aléatoire (tests d'intégration du graphe sans GGUF).
+// ---------------------------------------------------------------------------
+
+fn randT(sh: zml.Shape, stddev: f64) zml.Tensor {
+    return zml.Tensor.Rng.normal(sh, .{ .mean = 0, .stddev = stddev });
+}
+
+pub fn randomLayer(cfg: Config, idx: u32) Layer {
+    const global = cfg.isGlobal(idx);
+    const d = cfg.d;
+    const extent: i64 = if (global) cfg.rel_extent else cfg.swa;
+    return .{
+        .is_global = global,
+        .attn_norm = if (global) null else randT(.init(.{ .d = d }, .f32), 1),
+        .q_inp_norm = if (global) randT(.init(.{ .d = d }, .f32), 1) else null,
+        .k_inp_norm = if (global) randT(.init(.{ .d = d }, .f32), 1) else null,
+        .v_inp_norm = if (global) randT(.init(.{ .d = d }, .f32), 1) else null,
+        .wq = .init(randT(.init(.{ .dout = cfg.h * cfg.hd, .d = d }, .bf16), 0.05), null, .d),
+        .wk = .init(randT(.init(.{ .dout = cfg.hkv * cfg.hd, .d = d }, .bf16), 0.05), null, .d),
+        .wv = .init(randT(.init(.{ .dout = cfg.hkv * cfg.hd, .d = d }, .bf16), 0.05), null, .d),
+        .wo = .init(randT(.init(.{ .dout = d, .d = cfg.h * cfg.hd }, .bf16), 0.05), null, .d),
+        .wqkv_gate = .init(randT(.init(.{ .dout = cfg.h * cfg.hd, .d = d }, .bf16), 0.05), null, .d),
+        .sink_proj = .init(randT(.init(.{ .dout = cfg.h, .d = d }, .bf16), 0.05), null, .d),
+        .wrel = .init(randT(.init(.{ .dout = cfg.h * cfg.d_rel, .d = d }, .bf16), 0.05), null, .d),
+        .rel_bias = randT(.init(.{ .extent = extent, .d_rel = cfg.d_rel }, .f32), 0.1),
+        .rel_clip = randT(.init(.{ .h = cfg.h, .d_rel = cfg.d_rel }, .f32), 1),
+        .q_clip = randT(.init(.{ .h = cfg.h, .hd = cfg.hd }, .f32), 1),
+        .k_conv = randT(.init(.{ .d_kv = cfg.hkv * cfg.hd, .kernel = cfg.sconv_kernel }, .f32), 0.1),
+        .v_conv = randT(.init(.{ .d_kv = cfg.hkv * cfg.hd, .kernel = cfg.sconv_kernel }, .f32), 0.1),
+        .k_conv_proj = if (global) .init(randT(.init(.{ .dout = cfg.sconv_kernel * cfg.hkv, .d = d }, .f32), 0.1), null, .d) else null,
+        .v_conv_proj = if (global) .init(randT(.init(.{ .dout = cfg.sconv_kernel * cfg.hkv, .d = d }, .f32), 0.1), null, .d) else null,
+        .attn_post_conv = randT(.init(.{ .d = d, .kernel = cfg.sconv_kernel }, .f32), 0.1),
+        .ffn_post_conv = randT(.init(.{ .d = d, .kernel = cfg.sconv_kernel }, .f32), 0.1),
+        .attn_res_query = if (idx == 0) null else if (global)
+            randT(.init(.{ .q = 3, .d = d }, .f32), 0.1)
+        else
+            randT(.init(.{ .d = d }, .f32), 0.1),
+        .ffn_res_query = randT(.init(.{ .d = d }, .f32), 0.1),
+        .ffn_norm = randT(.init(.{ .d = d }, .f32), 1),
+        .router = .init(randT(.init(.{ .expert = cfg.n_experts, .d = d }, .f32), 0.1), null, .d),
+        .router_bias = randT(.init(.{ .expert = cfg.n_experts }, .f32), 0.1),
+        .gate_up_exps = .init(randT(.init(.{ .expert = cfg.n_experts, .dout = 2 * cfg.ff_exp, .d = d }, .bf16), 0.05), null, .d),
+        .down_exps = .init(randT(.init(.{ .expert = cfg.n_experts, .d = d, .dout = cfg.ff_exp }, .bf16), 0.05), null, .dout),
+    };
+}
+
+pub fn randomLoopCtrl(cfg: Config) LoopCtrl {
+    var down: [4]zml.nn.Linear = undefined;
+    var gain: [4]zml.nn.Linear = undefined;
+    var forget: [4]zml.nn.Linear = undefined;
+    inline for (LoopCtrl.names, 0..) |_, i| {
+        down[i] = .init(randT(.init(.{ .rank = cfg.gate_rank, .d2 = 2 * cfg.d }, .f32), 0.1), null, .d2);
+        gain[i] = .init(randT(.init(.{ .d = cfg.d, .rank = cfg.gate_rank }, .f32), 0.1), null, .rank);
+        forget[i] = .init(randT(.init(.{ .d = cfg.d, .rank = cfg.gate_rank }, .f32), 0.1), null, .rank);
+    }
+    return .{
+        .msg_query = randT(.init(.{ .ctrl = 4, .d = cfg.d }, .f32), 0.1),
+        .down = down,
+        .gain = gain,
+        .forget = forget,
+    };
+}
+
+pub fn randomModel(cfg: Config) Model {
+    var layers: [24]Layer = undefined;
+    for (&layers, 0..) |*l, i| l.* = randomLayer(cfg, @intCast(i));
+    var loop_ctrl: [12]LoopCtrl = undefined;
+    for (&loop_ctrl, 0..) |*lc, i| {
+        _ = i;
+        lc.* = randomLoopCtrl(cfg);
+    }
+    return .{
+        .config = cfg,
+        .token_embd = randT(.init(.{ .voc = cfg.vocab, .d = cfg.d }, .bf16), 0.05),
+        .token_embd_norm = randT(.init(.{ .d = cfg.d }, .f32), 1),
+        .layers = layers,
+        .loop_ctrl = loop_ctrl,
+        .output = randT(.init(.{ .voc = cfg.vocab, .d = cfg.d }, .bf16), 0.05),
+        .output_norm = randT(.init(.{ .d = cfg.d }, .f32), 1),
+        .output_res_query = randT(.init(.{ .d = cfg.d }, .f32), 0.1),
+    };
 }
