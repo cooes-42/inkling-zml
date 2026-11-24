@@ -57,6 +57,21 @@ Comparer les logits ZML vs llama.cpp (mainline, build ≥ #32704) sur les mêmes
 UD-Q8_K_XL, en bf16 déquantifié des deux côtés. Tolérance : écart relatif < 1e-2 sur les top logits
 (premier jalon), puis ppl équivalente. Benchmarks tok/s + mémoire ensuite.
 
+## D8 — Env de dev : Nix flake + Bazel bzlmod, ZML pinné par commit
+
+- `flake.nix` : `devShells.default` (bazelisk + wrapper `bazel`, zig, python3, uv, git, gh,
+  curl, jq) et `devShells.cuda` (cudatoolkit/cudnn/nccl, `allowUnfree`) pour `--config=cuda`.
+  nixpkgs pinné via `flake.lock` (nixos-unstable 2026-11-21).
+- Bazel 9.3.0 (`.bazelversion`, == zml), Zig 0.17.0 hermétique téléchargé par rules_zig
+  (le `zig` du shell, 0.17.1, ne sert que pour ZLS/édition).
+- `MODULE.bazel` : `bazel_dep(name="zml")` + `git_override` au commit master
+  `1470ac33f58ad5795076695a6965abf0f38d4272` ; blocs toolchain/overrides copiés de zml
+  (seuls les overrides du module racine s'appliquent en bzlmod), patches dans `third_party/`.
+- `.bazelrc` : flags communs repris de zml + configs `--config=cpu|cuda|metal`, `release`, `native`.
+- Validé ici : `nix flake show`, `nix develop` démarre, `bazel version` = 9.3.0,
+  `bazel query @zml//zml:zml` résout (module graph OK). Le premier build complet
+  (LLVM/XLA/Zig) est long : à faire en local.
+
 ## D7 — Repo
 
 - Git initialisé, remote `cooes-42/inkling-zml` (public), branche `main`.
