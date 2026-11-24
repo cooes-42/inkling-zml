@@ -28,6 +28,8 @@
       zmlCommit = "1470ac33f58ad5795076695a6965abf0f38d4272";
       bazelVersion = "9.3.0";
       basePackages = pkgs: [
+        # `bazel` wrapper around bazelisk (same as zml's own devenv)
+        (pkgs.writeShellScriptBin "bazel" ''exec ${pkgs.bazelisk}/bin/bazelisk "$@"'')
         pkgs.bazelisk
         pkgs.zig # editor/ZLS only; the hermetic Zig 0.17.0 toolchain is fetched by rules_zig
         pkgs.python3
