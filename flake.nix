@@ -42,6 +42,23 @@
       ];
     in
     {
+      packages = forAllSystems (pkgs: {
+        # Bazel's process wrapper execs /bin/bash, which does not exist on NixOS.
+        # `nix run .#bazel-fhs -- <args>` runs bazelisk inside a bubblewrap
+        # namespace where /bin/bash exists; the host fs is mounted read-only,
+        # nothing on the host is modified.
+        bazel-fhs = pkgs.writeShellScriptBin "bazel" ''
+          exec ${pkgs.bubblewrap}/bin/bwrap \
+            --bind / / \
+            --dev-bind /dev /dev \
+            --proc /proc \
+            --tmpfs /tmp \
+            --bind ${pkgs.bash}/bin/bash /bin/bash \
+            --setenv USE_BAZEL_VERSION "${bazelVersion}" \
+            -- ${pkgs.bazelisk}/bin/bazelisk "$@"
+        '';
+      });
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = basePackages pkgs;
