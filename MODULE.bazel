@@ -1,0 +1,102 @@
+module(
+    name = "inkling-zml",
+    version = "0.0.1",
+)
+
+#####################################################################
+# ZML, pinned to a master commit (keep in sync with flake.nix).
+#####################################################################
+bazel_dep(name = "zml", version = "0.0.0")
+
+git_override(
+    module_name = "zml",
+    commit = "1470ac33f58ad5795076695a6965abf0f38d4272",
+    remote = "https://github.com/zml/zml.git",
+)
+
+#####################################################################
+# Zig toolchain — mirrors zml/MODULE.bazel (Zig 0.17.0, hermetic).
+# rules_zig downloads the compiler itself; the nix `zig` is for ZLS only.
+#####################################################################
+bazel_dep(name = "rules_zig", version = "0.17.0")
+
+archive_override(
+    module_name = "rules_zig",
+    integrity = "sha256-VbmdSIShN+sogoD3yI7yrvdZNXEf2a0MNLtxLAo1vDo=",
+    strip_prefix = "rules_zig-fdad034e362e5de4190bd704cc8d17907117c57e",
+    urls = ["https://github.com/hermeticbuild/rules_zig/archive/fdad034e362e5de4190bd704cc8d17907117c57e.tar.gz"],
+)
+
+zig = use_extension("@rules_zig//zig:extensions.bzl", "zig")
+zig.index(file = "@zml//bazel:zig_index.json")
+zig.toolchain(
+    extra_exec_compatible_with = ["@zml//platforms:local_execution"],
+    zig_version = "0.17.0",
+)
+zig.mirrors(urls = [
+    "https://pkg.machengine.org/zig",
+    "https://ziglang.freetls.fastly.net",
+    "https://ziglang.org/builds/",
+])
+use_repo(zig, "zig_toolchains")
+
+register_toolchains("@rules_zig//zig/target:all")
+register_toolchains("@zig_toolchains//:all")
+register_toolchains("@zml//:translate_c_toolchain")
+register_execution_platforms("@zml//platforms:local_execution_platform")
+
+zls = use_extension("@rules_zig//zig/zls:extensions.bzl", "zls")
+zls.toolchain(
+    zig_version = "0.17.0",
+    zls_version = "0.17.0+hermetic.1",
+)
+use_repo(zls, "zls_toolchains")
+register_toolchains("@zls_toolchains//:all")
+
+#####################################################################
+# LLVM toolchain (required by zml / XLA).
+#####################################################################
+bazel_dep(name = "llvm", version = "0.8.27")
+register_toolchains("@llvm//toolchain:all")
+
+#####################################################################
+# Overrides required by zml (only root-module overrides apply in
+# bzlmod — copied from zml/MODULE.bazel, patches in //third_party).
+#####################################################################
+single_version_override(
+    module_name = "abseil-cpp",
+    patch_strip = 1,
+    patches = [
+        "//third_party/abseil-cpp/bmi2intrin.patch",
+    ],
+    version = "20260526.0",
+)
+
+single_version_override(
+    module_name = "rules_distroless",
+    patch_strip = 1,
+    patches = [
+        "//third_party/rules_distroless/accept-nospace-version-constraints.patch",
+        "//third_party/rules_distroless/flat-repositories.patch",
+    ],
+    version = "0.8.0",
+)
+
+single_version_override(
+    module_name = "grpc",
+    patch_strip = 1,
+    patches = [
+        "//third_party/grpc/protobuf-35-upb-load.patch",
+        "//third_party/grpc/grpc++_unsecure-visibility.patch",
+        "//third_party/grpc/plugin-flags.patch",
+    ],
+    version = "1.80.0",
+)
+
+single_version_override(
+    module_name = "envoy_api",
+    version = "0.0.0-20250128-4de3c74",
+)
+
+# Added to support bazel 9+ since an old version is pulled by GRPC.
+bazel_dep(name = "rules_foreign_cc", version = "0.15.1")

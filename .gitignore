@@ -1,0 +1,20 @@
+# bazel
+/bazel-*
+/result*
+
+# zig
+/.zig-cache/
+/zig-out/
+
+# models & data (downloaded, never commit weights)
+*.gguf
+*.gguf_file
+/models/
+/data/
+
+# env
+/.direnv/
+/.venv/
+
+# os
+.DS_Store

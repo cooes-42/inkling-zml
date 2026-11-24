@@ -1,0 +1,72 @@
+# Faster hash function
+startup         --digest_function=blake3
+
+# Needed by LLVM and/or XLA
+common          --experimental_repo_remote_exec
+common          --enable_platform_specific_config
+
+# Host tools built optimized
+common          --host_compilation_mode=opt
+common          --@rules_zig//zig/settings:host_mode=release_safe
+
+# LLVM/XLA are too noisy
+common          --copt=-w
+common          --host_copt=-w
+
+# XLA and Triton require C++20
+common          --cxxopt=-std=c++20
+common          --host_cxxopt=-std=c++20
+common          --enable_runfiles
+
+# rules_python must not rely on the system Python for stage-1 bootstrap
+common          --@rules_python//python/config_settings:bootstrap_impl=script
+
+common          --experimental_check_output_files=false
+
+# Expose Zig shared cache dirs to sandboxed actions
+build:linux     --sandbox_add_mount_pair=/tmp
+build:linux     --sandbox_writable_path=/tmp
+build:linux     --sandbox_add_mount_pair=/var/tmp
+build:linux     --sandbox_writable_path=/var/tmp
+
+build           --worker_sandboxing
+common          --compilation_mode=dbg
+common          --experimental_cc_shared_library
+common          --incompatible_use_cc_configure_from_rules_cc
+common          --incompatible_autoload_externally=+@rules_cc,+@rules_python,+@rules_shell,+@rules_java
+common          --experimental_platform_in_output_dir
+common          --experimental_inmemory_sandbox_stashes
+common          --compiler=clang
+common          --incompatible_disallow_empty_glob=false
+
+# Link Zig code with the C linker
+common          --@rules_zig//zig/settings:use_cc_common_link=true
+common          --@rules_zig//zig/settings:use_standalone_translate_c=True
+common          --@llvm//config:experimental_stub_libgcc_s=true
+common:linux    --copt=-fPIC
+common          --@com_google_protobuf//bazel/toolchains:prefer_prebuilt_protoc=true
+
+test            --test_output=errors
+
+# --- configs -------------------------------------------------------------
+# debug: optimized backend, debug Zig frontend
+common:debug    --compilation_mode=opt
+common:debug    --@rules_zig//zig/settings:mode=debug
+common:debug    --strategy=ZigBuildLib=local
+common:debug    --strategy=ZigBuildObj=local
+common:debug    --strategy=ZigBuildTestLib=local
+
+common:release  --compilation_mode=opt
+common:release  --copt=-Ofast
+common:release  --strip=always
+common:release  --@rules_zig//zig/settings:mode=release_safe
+common:release  --@rules_zig//zig/settings:zigopt=-fllvm
+
+common:native   --copt=-march=native
+common:native   --@rules_zig//zig/settings:zigopt=-mcpu=native
+
+# --- ZML platforms -------------------------------------------------------
+# default is CPU; use --config=cuda / --config=metal for GPU
+build:cpu       --@zml//platforms:cpu=true
+build:cuda      --@zml//platforms:cpu=false --@zml//platforms:cuda=true
+build:metal     --@zml//platforms:cpu=false --@zml//platforms:metal=true

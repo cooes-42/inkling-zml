@@ -1,0 +1,2 @@
+# Root package. Zig sources live under //src (see src/BUILD.bazel).
+package(default_visibility = ["//visibility:public"])
