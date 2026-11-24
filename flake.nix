@@ -69,10 +69,18 @@
             };
             # Bazel invoque les actions via `env - /bin/bash -c ...` : `env -` vide
             # PATH et le bash nix retombe sur /no-such-path. Ce wrapper remet un
-            # PATH contenant /bin (où tools/bin est monté dans le namespace).
+            # PATH contenant /bin.
             bashFhs = pkgs.writeShellScript "bash-fhs" ''
               export PATH=/bin:/usr/bin
               exec ${pkgs.bash}/bin/bash "$@"
+            '';
+            # /bin complet pour le namespace : les outils + le wrapper bash.
+            binFinal = pkgs.runCommand "bazel-fhs-bin" { } ''
+              mkdir -p $out
+              cp -rs ${tools}/bin $out/bin
+              rm -f $out/bin/bash $out/bin/sh
+              cp ${bashFhs} $out/bin/bash
+              ln -s ${pkgs.bash}/bin/sh $out/bin/sh
             '';
           in
           pkgs.writeShellScriptBin "bazel" ''
@@ -81,9 +89,7 @@
               --dev-bind /dev /dev \
               --proc /proc \
               --tmpfs /tmp \
-              --tmpfs /bin \
-              --bind ${tools}/bin /bin \
-              --bind ${bashFhs} /bin/bash \
+              --ro-bind ${binFinal}/bin /bin \
               --setenv PATH "${tools}/bin" \
               --setenv USE_BAZEL_VERSION "${bazelVersion}" \
               -- ${tools}/bin/bazelisk "$@"
