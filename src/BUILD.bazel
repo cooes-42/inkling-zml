@@ -20,3 +20,14 @@ zig_binary(
     main = "gguf_dump.zig",
     deps = [":gguf"],
 )
+
+zig_library(
+    name = "gguf_store",
+    srcs = ["gguf_store.zig"],
+    main = "gguf_store.zig",
+    deps = [
+        ":gguf",
+        "@zml//zml",
+    ],
+    visibility = ["//visibility:public"],
+)

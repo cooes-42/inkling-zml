@@ -435,6 +435,78 @@ fn dequantFp4(block: []const u8, out: []f32, scale_kind: enum { e4m3, e8m0 }, gl
     }
 }
 
+/// Déquantifie un tenseur entier en bf16 (little-endian), côté host.
+/// `raw` = octets du tenseur (tous blocs), `scale_raw` = octets f32 du tenseur `.scale`
+/// (NVFP4 Unsloth : un f32 par expert, indexé par bloc / blocs_par_expert), `out` = elems*2 octets.
+pub fn dequantToBf16Host(ggml_type: GgmlType, elems: u64, dims: []const u64, raw: []const u8, scale_raw: ?[]const u8, out: []u8) !void {
+    if (out.len < elems * 2) return error.OutTooSmall;
+    switch (ggml_type) {
+        .bf16 => {
+            @memcpy(out[0..elems * 2], raw[0 .. elems * 2]);
+        },
+        .f16 => {
+            const out16 = std.mem.bytesAsSlice(u16, out[0 .. elems * 2]);
+            for (out16, 0..) |*o, i| {
+                const h = std.mem.readInt(u16, raw[i * 2 ..][0..2], .little);
+                o.* = f32ToBf16(f16ToF32(h));
+            }
+        },
+        .q8_0 => {
+            const bb = ggml_type.blockBytes().?;
+            var pos: usize = 0;
+            var off: usize = 0;
+            while (off < elems) {
+                const block = raw[pos .. pos + bb];
+                var tmp: [32]f32 = undefined;
+                try dequantBlock(.q8_0, block, &tmp, null);
+                for (tmp, 0..) |w, k| {
+                    if (off + k >= elems) break;
+                    std.mem.writeInt(u16, out[(off + k) * 2 ..][0..2], f32ToBf16(w), .little);
+                }
+                pos += bb;
+                off += 32;
+            }
+        },
+        .q8_k => {
+            const bb = ggml_type.blockBytes().?;
+            var pos: usize = 0;
+            var off: usize = 0;
+            while (off < elems) {
+                const block = raw[pos .. pos + bb];
+                var tmp: [256]f32 = undefined;
+                try dequantBlock(.q8_k, block, &tmp, null);
+                for (tmp, 0..) |w, k| {
+                    if (off + k >= elems) break;
+                    std.mem.writeInt(u16, out[(off + k) * 2 ..][0..2], f32ToBf16(w), .little);
+                }
+                pos += bb;
+                off += 256;
+            }
+        },
+        .nvfp4, .mxfp4 => {
+            const be: u64 = 256;
+            const bb = ggml_type.blockBytes().?;
+            const n_blocks = elems / be;
+            const per_expert_elems: u64 = if (dims.len >= 3) dims[0] * dims[1] else elems;
+            const blocks_per_expert = per_expert_elems / be;
+            const scales: []const f32 = if (scale_raw) |sr|
+                @alignCast(std.mem.bytesAsSlice(f32, sr))
+            else
+                &[_]f32{1.0};
+            for (0..n_blocks) |blk| {
+                const gs: f32 = if (blk / blocks_per_expert < scales.len) scales[blk / blocks_per_expert] else 1.0;
+                const block = raw[blk * bb .. (blk + 1) * bb];
+                var tmp: [256]f32 = undefined;
+                try dequantBlock(ggml_type, block, &tmp, gs);
+                for (tmp, 0..) |w, k| {
+                    std.mem.writeInt(u16, out[(blk * be + k) * 2 ..][0..2], f32ToBf16(w), .little);
+                }
+            }
+        },
+        else => return error.UnsupportedQuant,
+    }
+}
+
 /// Déquantifie un tenseur entier (tous ses blocs) en f32. `data` = octets du tenseur.
 pub fn dequantTensor(ggml_type: GgmlType, data: []const u8, out: []f32, global_scale: ?f32) !void {
     const be = ggml_type.blockElems() orelse {

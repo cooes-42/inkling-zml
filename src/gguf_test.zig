@@ -136,6 +136,25 @@ test "fp conversions" {
     try testing.expectEqual(@as(f32, 2.0), gguf.f16ToF32(0x4000));
 }
 
+test "dequantToBf16Host nvfp4 with per-expert scale" {
+    // 2 experts x 256 elems : bloc 0 expert 0, bloc 1 expert 1
+    var raw: [2 * 144]u8 = undefined;
+    @memset(raw[0..16], 0x38); // expert 0: scales 1.0
+    @memset(raw[16..144], 0x66); // nibbles 6 -> E2M1 4.0
+    @memset(raw[144 .. 144 + 16], 0x40); // expert 1: E4M3 0x40 = e=8 -> 2^(8-7)*(1+0)=2.0
+    @memset(raw[144 + 16 ..], 0x66);
+    var scale: [2]f32 = .{ 2.0, 3.0 };
+    var out: [512 * 2]u8 = undefined;
+    try gguf.dequantToBf16Host(.nvfp4, 512, &.{ 256, 1, 2 }, &raw, std.mem.asBytes(&scale), &out);
+    const o = std.mem.bytesAsSlice(u16, &out);
+    // expert 0: 4.0 * 1.0 * 2.0 = 8.0 -> bf16 0x4100
+    try testing.expectEqual(@as(u16, 0x4100), o[0]);
+    try testing.expectEqual(@as(u16, 0x4100), o[255]);
+    // expert 1: 4.0 * 2.0 * 3.0 = 24.0 -> bf16 0x41C0
+    try testing.expectEqual(@as(u16, 0x41C0), o[256]);
+    try testing.expectEqual(@as(u16, 0x41C0), o[511]);
+}
+
 test "block sizes" {
     try testing.expectEqual(@as(?u32, 32), gguf.GgmlType.q8_0.blockElems());
     try testing.expectEqual(@as(?u32, 34), gguf.GgmlType.q8_0.blockBytes());
