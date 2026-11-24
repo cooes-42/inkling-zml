@@ -63,7 +63,8 @@
                 pkgs.gnutar
                 pkgs.gzip
                 pkgs.which
-                pkgs.bash
+                # NB: pas pkgs.bash ici, sinon /bin/bash serait un symlink et le
+                # bind du wrapper bashFhs ci-dessous echouerait.
               ];
             };
             # Bazel invoque les actions via `env - /bin/bash -c ...` : `env -` vide
