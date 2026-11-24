@@ -1,5 +1,27 @@
 load("@rules_zig//zig:defs.bzl", "zig_binary", "zig_library", "zig_test")
 
+# Module "zml" local : sous-ensembles de @zml sans le tokenizer (sentencepiece cassé
+# en C++ modules avec notre toolchain clang — voir src/zml.zig).
+zig_library(
+    name = "zml",
+    srcs = ["zml.zig"],
+    main = "zml.zig",
+    import_name = "zml",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@zml//bazel",
+        "@zml//pjrt",
+        "@zml//stdx",
+        "@zml//zml/constants",
+        "@zml//zml/core",
+        "@zml//zml/kernels/moe",
+        "@zml//zml/meta",
+        "@zml//zml/nn",
+        "@zml//zml/profiling",
+        "@zml//zml/quantization",
+    ],
+)
+
 zig_library(
     name = "gguf",
     srcs = ["gguf.zig"],
@@ -27,7 +49,48 @@ zig_library(
     main = "gguf_store.zig",
     deps = [
         ":gguf",
-        "@zml//zml",
+        ":zml",
     ],
     visibility = ["//visibility:public"],
+)
+
+zig_library(
+    name = "inkling2",
+    srcs = [
+        "inkling2.zig",
+        "depth_mix.zig",
+        "loop_ctrl.zig",
+        "sconv.zig",
+        "moe.zig",
+    ],
+    main = "inkling2.zig",
+    deps = [
+        ":gguf",
+        ":zml",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+zig_binary(
+    name = "inkling_dump",
+    srcs = ["inkling_dump.zig"],
+    main = "inkling_dump.zig",
+    deps = [
+        ":gguf",
+        ":gguf_store",
+        ":inkling2",
+        ":zml",
+    ],
+)
+
+zig_binary(
+    name = "inkling",
+    srcs = ["main.zig"],
+    main = "main.zig",
+    deps = [
+        ":gguf",
+        ":gguf_store",
+        ":inkling2",
+        ":zml",
+    ],
 )

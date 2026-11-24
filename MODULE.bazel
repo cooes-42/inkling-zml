@@ -100,6 +100,6 @@ bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
 # Déclarés explicitement car référencés par des flags dans .bazelrc
 # (en bzlmod, les repos transitifs ne sont pas visibles depuis le module racine).
 bazel_dep(name = "rules_python", version = "1.9.0")
-bazel_dep(name = "rules_cc", version = "0.2.25")
+bazel_dep(name = "rules_cc", version = "0.2.19")
 bazel_dep(name = "rules_shell", version = "0.8.0")
 bazel_dep(name = "protobuf", version = "35.0", repo_name = "com_google_protobuf")

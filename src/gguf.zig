@@ -71,6 +71,11 @@ pub const GgmlType = enum(u32) {
         };
     }
 
+    /// Nom affichable sans panique sur les valeurs inconnues (wildcard `_`).
+    pub fn name(t: GgmlType) []const u8 {
+        return std.enums.tagName(GgmlType, t) orelse "unknown";
+    }
+
     pub fn elemBytes(self: GgmlType) u32 {
         return switch (self) {
             .f32, .i32 => 4,
@@ -119,7 +124,7 @@ pub const TensorInfo = struct {
         const e = self.elems();
         const n0 = self.ne0();
         if (self.ggml_type.blockElems()) |be| {
-            const bb = self.ggml_type.blockBytes().?;
+            const bb = self.ggml_type.blockBytes() orelse return 0; // IQ*: taille à définir
             const n_blocks = (n0 + be - 1) / be;
             return n_blocks * bb * (e / n0);
         }

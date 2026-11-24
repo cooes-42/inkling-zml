@@ -35,7 +35,10 @@ build           --worker_sandboxing
 
 # Memory caps: a dbg `build //...` with --jobs=10 OOM-killed the 30 Go machine on
 # 2026-11-24 (output base on a tmpfs). Keep action RAM and jobs bounded.
-build           --local_ram_resources=HOST_RAM*.5
+# NOTE: --local_ram_resources was removed in Bazel 9 (use --local_resources=name=value
+# for named resources); the real guards are /tmp on disk (bazel-fhs), -Xmx2g above and
+# --jobs=4. This sandbox memory cap only applies if the sandbox is ever re-enabled.
+build           --experimental_sandbox_memory_limit_mb=HOST_RAM*.5
 build           --jobs=4
 
 # NixOS: /bin/bash n'existe pas, le process-wrapper du sandbox plante dessus.

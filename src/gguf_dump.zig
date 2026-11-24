@@ -35,12 +35,42 @@ fn dump(g: *const gguf.Gguf, maybe_name: ?[]const u8) void {
         g.getKvString("general.name") orelse "?",
     });
     if (maybe_name) |name| {
+        if (std.mem.eql(u8, name, "--stats")) {
+            var total_elems: u64 = 0;
+            var total_raw: u64 = 0;
+            var it2 = g.tensors.iterator();
+            while (it2.next()) |e| {
+                total_elems += e.value_ptr.elems();
+                total_raw += e.value_ptr.byteSize();
+            }
+            std.debug.print("tensors={d} elems={d} raw={d} ({d:.1} Go) bf16={d} ({d:.1} Go)\n", .{
+                g.tensor_count,
+                total_elems,
+                total_raw,
+                @as(f64, @floatFromInt(total_raw)) / 1e9,
+                total_elems * 2,
+                @as(f64, @floatFromInt(total_elems * 2)) / 1e9,
+            });
+            return;
+        }
+        if (std.mem.startsWith(u8, name, "--grep=")) {
+            const pat = name["--grep=".len..];
+            var it = g.tensors.iterator();
+            while (it.next()) |e| {
+                if (std.mem.indexOf(u8, e.key_ptr.*, pat)) |_| {
+                    std.debug.print("  {s} dims={any} type={s} off={d} bytes={d}\n", .{
+                        e.key_ptr.*, e.value_ptr.dims, e.value_ptr.ggml_type.name(), e.value_ptr.offset, e.value_ptr.byteSize(),
+                    });
+                }
+            }
+            return;
+        }
         const t = g.tensor(name) orelse {
             std.debug.print("tensor {s} not found\n", .{name});
             return;
         };
         std.debug.print("{s}: dims={any} type={s} offset={d} bytes={d}\n", .{
-            name, t.dims, @tagName(t.ggml_type), t.offset, t.byteSize(),
+            name, t.dims, t.ggml_type.name(), t.offset, t.byteSize(),
         });
         return;
     }
@@ -48,8 +78,8 @@ fn dump(g: *const gguf.Gguf, maybe_name: ?[]const u8) void {
     var i: u64 = 0;
     while (it.next()) |e| : (i += 1) {
         if (i >= 12) break;
-        std.debug.print("  {s} dims={any} type={s} off={d}\n", .{
-            e.key_ptr.*, e.value_ptr.dims, @tagName(e.value_ptr.ggml_type), e.value_ptr.offset,
+        std.debug.print("  {s} dims={any} type={s} off={d} bytes={d}\n", .{
+            e.key_ptr.*, e.value_ptr.dims, e.value_ptr.ggml_type.name(), e.value_ptr.offset, e.value_ptr.byteSize(),
         });
     }
 }
