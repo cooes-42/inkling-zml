@@ -1,0 +1,22 @@
+load("@rules_zig//zig:defs.bzl", "zig_binary", "zig_library", "zig_test")
+
+zig_library(
+    name = "gguf",
+    srcs = ["gguf.zig"],
+    main = "gguf.zig",
+    visibility = ["//visibility:public"],
+)
+
+zig_test(
+    name = "gguf_test",
+    srcs = ["gguf_test.zig"],
+    main = "gguf_test.zig",
+    deps = [":gguf"],
+)
+
+zig_binary(
+    name = "gguf_dump",
+    srcs = ["gguf_dump.zig"],
+    main = "gguf_dump.zig",
+    deps = [":gguf"],
+)

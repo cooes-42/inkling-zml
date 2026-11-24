@@ -45,13 +45,9 @@ register_toolchains("@zig_toolchains//:all")
 register_toolchains("@zml//:translate_c_toolchain")
 register_execution_platforms("@zml//platforms:local_execution_platform")
 
-zls = use_extension("@rules_zig//zig/zls:extensions.bzl", "zls")
-zls.toolchain(
-    zig_version = "0.17.0",
-    zls_version = "0.17.0+hermetic.1",
-)
-use_repo(zls, "zls_toolchains")
-register_toolchains("@zls_toolchains//:all")
+# ZLS : ne PAS redéclarer ici (zml déclare déjà son toolchain ZLS 0.17.0 dans son
+# MODULE.bazel et rules_zig n'autorise qu'un seul toolchain ZLS par version).
+# Pour l'édition, utiliser le `zig`/zls du shell nix (flake.nix).
 
 #####################################################################
 # LLVM toolchain (required by zml / XLA).
@@ -100,3 +96,10 @@ single_version_override(
 
 # Added to support bazel 9+ since an old version is pulled by GRPC.
 bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
+
+# Déclarés explicitement car référencés par des flags dans .bazelrc
+# (en bzlmod, les repos transitifs ne sont pas visibles depuis le module racine).
+bazel_dep(name = "rules_python", version = "1.9.0")
+bazel_dep(name = "rules_cc", version = "0.2.25")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+bazel_dep(name = "protobuf", version = "35.0", repo_name = "com_google_protobuf")
