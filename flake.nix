@@ -76,9 +76,6 @@
               --tmpfs /bin \
               --bind ${pkgs.bash}/bin/bash /bin/bash \
               --bind ${pkgs.bash}/bin/sh /bin/sh \
-              --dir /usr \
-              --dir /usr/bin \
-              --symlink ${tools}/bin/env /usr/bin/env \
               --setenv PATH "${tools}/bin" \
               --setenv USE_BAZEL_VERSION "${bazelVersion}" \
               -- ${tools}/bin/bazelisk "$@"
