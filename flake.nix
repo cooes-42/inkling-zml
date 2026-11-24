@@ -47,18 +47,42 @@
         # `nix run .#bazel-fhs -- <args>` runs bazelisk inside a bubblewrap
         # namespace where /bin/bash exists; the host fs is mounted read-only,
         # nothing on the host is modified.
-        bazel-fhs = pkgs.writeShellScriptBin "bazel" ''
-          exec ${pkgs.bubblewrap}/bin/bwrap \
-            --bind / / \
-            --dev-bind /dev /dev \
-            --proc /proc \
-            --tmpfs /tmp \
-            --tmpfs /bin \
-            --bind ${pkgs.bash}/bin/bash /bin/bash \
-            --bind ${pkgs.bash}/bin/sh /bin/sh \
-            --setenv USE_BAZEL_VERSION "${bazelVersion}" \
-            -- ${pkgs.bazelisk}/bin/bazelisk "$@"
-        '';
+        bazel-fhs =
+          let
+            # Bazel's shell actions need /bin/bash plus the usual unix tools,
+            # which don't live in /usr/bin on NixOS.
+            tools = pkgs.buildEnv {
+              name = "bazel-fhs-tools";
+              paths = (basePackages pkgs) ++ [
+                pkgs.coreutils
+                pkgs.gnused
+                pkgs.gawk
+                pkgs.gnugrep
+                pkgs.findutils
+                pkgs.diffutils
+                pkgs.gnutar
+                pkgs.gzip
+                pkgs.which
+                pkgs.bash
+              ];
+            };
+          in
+          pkgs.writeShellScriptBin "bazel" ''
+            exec ${pkgs.bubblewrap}/bin/bwrap \
+              --bind / / \
+              --dev-bind /dev /dev \
+              --proc /proc \
+              --tmpfs /tmp \
+              --tmpfs /bin \
+              --bind ${pkgs.bash}/bin/bash /bin/bash \
+              --bind ${pkgs.bash}/bin/sh /bin/sh \
+              --dir /usr \
+              --dir /usr/bin \
+              --bind ${tools}/bin/env /usr/bin/env \
+              --setenv PATH "${tools}/bin" \
+              --setenv USE_BAZEL_VERSION "${bazelVersion}" \
+              -- ${tools}/bin/bazelisk "$@"
+          '';
       });
 
       devShells = forAllSystems (pkgs: {
