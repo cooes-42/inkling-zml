@@ -69,4 +69,5 @@ common:native   --@rules_zig//zig/settings:zigopt=-mcpu=native
 # default is CPU; use --config=cuda / --config=metal for GPU
 build:cpu       --@zml//platforms:cpu=true
 build:cuda      --@zml//platforms:cpu=false --@zml//platforms:cuda=true
+build:rocm      --@zml//platforms:cpu=false --@zml//platforms:rocm=true
 build:metal     --@zml//platforms:cpu=false --@zml//platforms:metal=true
