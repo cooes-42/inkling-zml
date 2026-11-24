@@ -74,8 +74,7 @@
               --proc /proc \
               --tmpfs /tmp \
               --tmpfs /bin \
-              --bind ${pkgs.bash}/bin/bash /bin/bash \
-              --bind ${pkgs.bash}/bin/sh /bin/sh \
+              --bind ${tools}/bin /bin \
               --setenv PATH "${tools}/bin" \
               --setenv USE_BAZEL_VERSION "${bazelVersion}" \
               -- ${tools}/bin/bazelisk "$@"

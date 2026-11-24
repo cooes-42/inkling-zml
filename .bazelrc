@@ -34,9 +34,9 @@ build           --worker_sandboxing
 # NixOS: /bin/bash n'existe pas, le process-wrapper du sandbox plante dessus.
 # En dev local on désactive le sandbox (les --sandbox_* ci-dessus sont alors sans effet).
 common          --spawn_strategy=local
-# Propager le PATH du client (nix .#bazel-fhs) aux actions : les scripts de test
-# bazel_tools ont des shebangs #!/usr/bin/env bash qui sinon echouent (exit 127).
-common          --action_env=PATH
+# Propager le PATH aux actions (nix .#bazel-fhs monte tools/bin sur /bin) :
+# les scripts bazel_tools ont des shebangs #!/usr/bin/env bash (sinon exit 127).
+common          --action_env=PATH=/bin:/usr/bin
 common          --compilation_mode=dbg
 common          --experimental_cc_shared_library
 common          --incompatible_use_cc_configure_from_rules_cc
