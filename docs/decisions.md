@@ -57,6 +57,40 @@ Comparer les logits ZML vs llama.cpp (mainline, build ≥ #32704) sur les mêmes
 UD-Q8_K_XL, en bf16 déquantifié des deux côtés. Tolérance : écart relatif < 1e-2 sur les top logits
 (premier jalon), puis ppl équivalente. Benchmarks tok/s + mémoire ensuite.
 
+## D9 — Attention : sdpa stablehlo en v1, paged attention en v2
+
+Vérifié dans le code ZML (master 1470ac3) :
+- `zml.nn.sdpa` : `attn_mask` additif + `causalAttnMask(..., window_len)` (SWA) +
+  `softmax_bias` dont `softmaxBiased` = `exp(x)/(Σexp+bias)` = **exactement** le sink
+  llama.cpp (bias = 1 par tête). `kq_b` passe en `attn_mask` additif `{h,q,k}`.
+- `zml.kernels.paged_attention` : `mask.standard{causal, sliding_window}` + `sink` +
+  `scale`, mais **pas de biais relatif** (kq_b).
+
+Chiffrage : sdpa matérialise les logits `{h,q,k}` f32 → couches SWA OK à 32K
+(24×32K×1025×4 ≈ 3,1 Go), mais une couche globale à 32K ≈ 98 Go → impossible.
+
+**Décision** : v1 = sdpa partout (correct, validation logits à 4–8K de contexte) ;
+v2 = paged attention pour les 20 couches SWA (natif) + extension `relative_bias`
+(patch local de zml) ou noyau custom pour les 4 couches globales (5/11/17/23).
+
+## D10 — SiTU : MoE manuel en v1, patch ZML en phase perf
+
+`ActivationKind` de ZML n'a pas SiTU. v1 : MoE manuel (top-8, gather experts, MLP avec
+SiTU custom, pondération × route_scale) en stablehlo — correct mais plus lent.
+Phase perf : ajouter un variant `.situ` dans `zml/kernels/moe/api/api.zig`.
+
+## D11 — Depth-mix : `blocks` en tenseur stacké fixe `{6, b, s, d}` + masque
+
+Le graphe ZML est statique : `blocks` (1..6 entrées par bloc de 6 visites, reset à
+chaque bloc + banque de boucle) est représenté par un stack fixe de 6 avec masque de
+validité, ou un tuple de 6 tenseurs (zéros masqués hors bloc). À prototyper tôt :
+attn_res / ffn_res / output_res / banque de boucle en dépendent.
+
+## D12 — Petits tenseurs F32 restent en f32
+
+Normes, convs sconv, clips, router, loop ctrl : gardés en `.f32` (et non downcast bf16),
+comme llama.cpp. Négligeable en mémoire (~qq Mo), plus fidèle.
+
 ## D8 — Env de dev : Nix flake + Bazel bzlmod, ZML pinné par commit
 
 - `flake.nix` : `devShells.default` (bazelisk + wrapper `bazel`, zig, python3, uv, git, gh,
