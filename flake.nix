@@ -76,10 +76,11 @@
             '';
             # /bin complet pour le namespace : les outils + le wrapper bash.
             binFinal = pkgs.runCommand "bazel-fhs-bin" { } ''
-              mkdir -p $out
-              cp -rs ${tools}/bin $out/bin
+              mkdir -p $out/bin
+              for f in ${tools}/bin/*; do ln -s "$f" "$out/bin/$(basename "$f")"; done
               rm -f $out/bin/bash $out/bin/sh
               cp ${bashFhs} $out/bin/bash
+              chmod +x $out/bin/bash
               ln -s ${pkgs.bash}/bin/sh $out/bin/sh
             '';
           in
