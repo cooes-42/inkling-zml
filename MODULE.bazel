@@ -67,7 +67,7 @@ single_version_override(
     module_name = "abseil-cpp",
     patch_strip = 1,
     patches = [
-        "//third_party/abseil-cpp/bmi2intrin.patch",
+        "//third_party/abseil-cpp:bmi2intrin.patch",
     ],
     version = "20260526.0",
 )
@@ -76,8 +76,8 @@ single_version_override(
     module_name = "rules_distroless",
     patch_strip = 1,
     patches = [
-        "//third_party/rules_distroless/accept-nospace-version-constraints.patch",
-        "//third_party/rules_distroless/flat-repositories.patch",
+        "//third_party/rules_distroless:accept-nospace-version-constraints.patch",
+        "//third_party/rules_distroless:flat-repositories.patch",
     ],
     version = "0.8.0",
 )
@@ -86,9 +86,9 @@ single_version_override(
     module_name = "grpc",
     patch_strip = 1,
     patches = [
-        "//third_party/grpc/protobuf-35-upb-load.patch",
-        "//third_party/grpc/grpc++_unsecure-visibility.patch",
-        "//third_party/grpc/plugin-flags.patch",
+        "//third_party/grpc:protobuf-35-upb-load.patch",
+        "//third_party/grpc:grpc++_unsecure-visibility.patch",
+        "//third_party/grpc:plugin-flags.patch",
     ],
     version = "1.80.0",
 )
