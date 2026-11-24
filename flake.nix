@@ -84,12 +84,16 @@
               ln -s ${pkgs.bash}/bin/sh $out/bin/sh
             '';
           in
+          # /tmp de l'hôte (disque), PAS une tmpfs : une output base bazel
+          # (--output_user_root=/tmp/...) sur tmpfs consomme la RAM et a
+          # provoqué un OOM global le 2026-11-24 ; chaque invocation spawnait
+          # aussi un nouveau serveur bazel (tmpfs privée par namespace).
           pkgs.writeShellScriptBin "bazel" ''
             exec ${pkgs.bubblewrap}/bin/bwrap \
               --bind / / \
               --dev-bind /dev /dev \
               --proc /proc \
-              --tmpfs /tmp \
+              --bind /tmp /tmp \
               --ro-bind ${binFinal}/bin /bin \
               --setenv PATH "${tools}/bin" \
               --setenv USE_BAZEL_VERSION "${bazelVersion}" \
