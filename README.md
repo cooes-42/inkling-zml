@@ -34,6 +34,23 @@ bazel build --config=cuda  //src:inkling-zml        # NVIDIA GPU
 bazel run   --config=cpu   //src:inkling-zml -- --model=models/Inkling-2-Mini-UD-Q8_K_XL.gguf --prompt="Hello"
 ```
 
+### NixOS note
+
+Bazel's process wrapper execs `/bin/bash`, which doesn't exist on NixOS. Use the
+flake-provided wrapper, which runs bazelisk inside a bubblewrap namespace that
+provides `/bin/bash` + unix tools (host filesystem untouched):
+
+```bash
+nix run .#bazel-fhs -- build //src:gguf_store --config=cpu
+nix run .#bazel-fhs -- test  //src:gguf_test
+```
+
+### Memory note
+
+Large C++/Zig builds can OOM if `--jobs` is too high for the available RAM.
+Lower it (e.g. `--jobs=4`) and/or cap RAM per action with
+`--local_ram_resources=HOST_RAM*.0.5`, and `bazel shutdown` between heavy runs.
+
 ## Weights
 
 Download the mainline GGUF (rename `.gguf_file` → `.gguf`):
