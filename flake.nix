@@ -53,7 +53,9 @@
             --dev-bind /dev /dev \
             --proc /proc \
             --tmpfs /tmp \
+            --tmpfs /bin \
             --bind ${pkgs.bash}/bin/bash /bin/bash \
+            --bind ${pkgs.bash}/bin/sh /bin/sh \
             --setenv USE_BAZEL_VERSION "${bazelVersion}" \
             -- ${pkgs.bazelisk}/bin/bazelisk "$@"
         '';
