@@ -78,7 +78,7 @@
               --bind ${pkgs.bash}/bin/sh /bin/sh \
               --dir /usr \
               --dir /usr/bin \
-              --bind ${tools}/bin/env /usr/bin/env \
+              --symlink ${tools}/bin/env /usr/bin/env \
               --setenv PATH "${tools}/bin" \
               --setenv USE_BAZEL_VERSION "${bazelVersion}" \
               -- ${tools}/bin/bazelisk "$@"
