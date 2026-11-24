@@ -57,6 +57,27 @@ Comparer les logits ZML vs llama.cpp (mainline, build ≥ #32704) sur les mêmes
 UD-Q8_K_XL, en bf16 déquantifié des deux côtés. Tolérance : écart relatif < 1e-2 sur les top logits
 (premier jalon), puis ppl équivalente. Benchmarks tok/s + mémoire ensuite.
 
+## D13 — Stratégie de poids long terme : les 10 builds UD Unsloth, tous déquantifiés en bf16 au chargement
+
+Objectif : supporter les GGUF Unsloth (racine `UD-IQ1_S … UD-Q8_K_XL` + `Mainline_Support`),
+pas seulement UD-Q8_K_XL. Comme on déquantifie tout en bf16 au chargement (D3), le choix du
+quant ne change que les octets lus, pas le graphe — la complexité reste l'architecture
+(boucle, MoE), pas la quantification. Le loader Zig portera les `dequantize_row_*` de ggml
+pour tous les types présents (table dans `docs/loader-gguf.md` §5).
+
+**Correction factuelle** (vérifiée en parsant les en-têtes GGUF, 2026-11-24) : ni le root
+`Inkling-2-Mini-UD-Q4_K_XL.gguf` ni `Mainline_Support/...UD-Q8_K_XL.gguf_file` ne sont
+« déroulés en 48 blocs » — tous deux ont `general.architecture=inkling2_loop`,
+`block_count=24`, `loop.{start:6,end:18,count:3}` et les tenseurs `loop_*`. Il n'existe donc
+pas de fichier Unsloth où la boucle serait aplatie dans les poids : le mécanisme
+`mix`/`control` (D2) reste à implémenter quel que soit le fichier choisi. Le « déroulé 48
+blocs » mentionné dans certaines analyses ne correspond à aucun des fichiers parsés.
+
+Conséquence pratique : v1 = `Mainline_Support/UD-Q8_K_XL` (compatible llama.cpp pour la
+validation des logits, D6) ; plus tard = n'importe quel build UD racine (Q4_K_XL recommandé
+par Unsloth, 17,6 Go) avec le même code, juste d'autres types de blocs à déquantifier.
+KV cache : 48 visites dans tous les cas (~6,4 Go bf16 à 32K, cf. loader-gguf.md §8).
+
 ## D9 — Attention : sdpa stablehlo en v1, paged attention en v2
 
 Vérifié dans le code ZML (master 1470ac3) :

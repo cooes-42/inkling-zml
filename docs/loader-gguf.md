@@ -69,12 +69,42 @@ w[i] = e2m1(qs_nibble[i]) * f32(e4m3(block_scales[i / 16])) * expert_scale[e]
   `e>0 : (-1)^s * 2^(e-7) * (1 + m/8)` ; `e==0 : (-1)^s * 2^-6 * (m/8)` ; max 448.
 - Ordre des éléments dans le bloc = ordre ggml (ne[0] contigu).
 
-## 5. Autres quants (phases ultérieures, formules de référence)
+## 5. Tous les types de quants à supporter (objectif long terme : les 10 builds UD Unsloth)
 
-- **Q8_K** (type 15) : bloc 256 = 290 o `{ f32 d; i8 qs[256]; i16 bsums[16] }`, `w = q*d` (bsums = optimisation dot, ignorable).
-- **Q4_K** (type 12) : bloc 256 = 144 o `{ f16 d; f16 dmin; u8 scales[12]; u8 qs[128] }`,
-  8 sous-blocs de 32 : `w = d * s_lo(6 bits) * q4 - dmin * s_hi(6 bits)`, scales 6+6 bits packés dans 12 o.
-- **IQ*** : tables de lookup ggml (`kvalues_iq*`), à reprendre de `ggml.c` si besoin.
+Fichiers visés (`unsloth/Inkling-2-Mini-GGUF`) : racine `UD-IQ1_M/IQ1_S/IQ2_XXS/IQ3_XXS/
+IQ4_XS/Q2_K_XL/Q3_K_XL/Q4_K_M/Q4_K_XL/Q8_K_XL.gguf` + `Mainline_Support/*.gguf_file` +
+`mmproj-F16.gguf` (vision, phase ultérieure) + `dspark/` (drafter MTP, hors scope).
+
+Types observés en parsant les en-têtes (UD-Q4_K_XL racine, UD-Q8_K_XL mainline) :
+Q8_0, F32, BF16, NVFP4 — et selon les builds : Q4_K, Q3_K, Q2_K, Q5_K, Q6_K, Q8_K,
+IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4.
+
+Table de déquantification (à porter depuis `ggml.c` `dequantize_row_*` en Zig) :
+
+| type ggml | id | bloc (o / elems) | formule |
+|---|---|---|---|
+| F32 / F16 / BF16 | 0/1/30 | natif | — |
+| Q4_0 | 2 | 18 / 32 | `w = (nibble - 8) * d` |
+| Q5_0 | 6 | 22 / 32 | `w = (q5 - 16) * d` |
+| Q8_0 | 8 | 34 / 32 | `w = q * d` (d en f16) — **présent dans UD-Q4_K_XL** |
+| Q2_K | 10 | 84 / 256 | 16 sous-blocs, `w = d*sc*q2 - dmin?` (cf. ggml.c) |
+| Q3_K | 11 | 110 / 256 | cf. ggml.c |
+| Q4_K | 12 | 144 / 256 | 8 sous-blocs de 32 : `w = d*s_lo*q4 - dmin*s_hi` (scales 6+6 bits dans 12 o) |
+| Q5_K | 13 | 176 / 256 | cf. ggml.c |
+| Q6_K | 14 | 210 / 256 | cf. ggml.c |
+| Q8_K | 15 | 292 / 256 | `{ f32 d; i8 qs[256]; i16 bsums[16] }`, `w = q*d` (bsums ignorable) |
+| IQ1_S/IQ1_M | 19/29 | ~34-42 / 256 | LUT `kvalues_iq1s`, cf. ggml.c |
+| IQ2_XXS/XS/S | 16/17/22 | 42/46/66? / 256 | LUT `kvalues_iq2xs`, cf. ggml-impl.h |
+| IQ3_XXS/S | 18/21 | 46?/110 / 256 | LUT, cf. ggml.c |
+| IQ4_NL / IQ4_XS | 20/23 | 18?/144 / 256 | cf. ggml.c |
+| MXFP4 | 39 | 136 / 256 | 8 scales E8M0 + 128 o nibbles E2M1 |
+| NVFP4 | 40 | 144 / 256 | 16 scales E4M3 + 128 o nibbles E2M1 × scale F32 externe (vérifié) |
+
+Règle générale ggml : la quantification court sur `ne[0]` (dimension contiguë) par blocs
+complets ; ici toutes les dims pertinentes sont divisibles par 256 (2304 = 9×256,
+1152, 1024, 3072, 384…), donc aucun chevauchement de bloc entre lignes.
+Priorité v1 : F32, BF16, Q8_0, NVFP4 (présents dans UD-Q8_K_XL mainline) + Q8_K.
+Le reste (K-quants, IQ) vient avec les builds UD intermédiaires.
 
 ## 6. Mapping noms GGUF → model struct ZML (dims logiques, ordre ggml inversé)
 
