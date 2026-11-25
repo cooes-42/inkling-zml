@@ -354,6 +354,8 @@ const loop_ctrl_mod = @import("loop_ctrl.zig");
 const sconv = @import("sconv.zig");
 const moe = @import("moe.zig");
 
+pub const nb_max = depth_mix.nb_max;
+
 /// rmsNorm avec poids (comme build_norm RMS de llama.cpp), calcul en f32.
 pub fn rmsNormW(x: zml.Tensor, w: zml.Tensor, eps: f32) zml.Tensor {
     return zml.nn.rmsNorm(x.convert(.f32), .d, eps)
@@ -642,7 +644,7 @@ pub fn msgsFn(inp: MsgsIn) MsgsOut {
     const cfg = inp.cfg;
     const start: i64 = @as(i64, @intCast(preludeBlockCount(cfg))) + 1;
     const bank = inp.blocks.slice(.nb, .{ .start = start, .end = depth_mix.nb_max }); // {.nb = nb_max-start, .s, .d}
-    const n_bank = inp.n_blocks.subConstant(@intCast(start));
+    const n_bank = inp.n_blocks.subConstant(@as(u32, @intCast(start)));
     const msgs = depth_mix.mix(bank, n_bank, inp.cur, inp.msg_query.rename(.{ .ctrl = .q })); // {.q, .s, .d}
     return .{ .msgs = msgs };
 }
