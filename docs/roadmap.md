@@ -35,14 +35,31 @@ cours), puis inférence réelle (voir blocage RAM ci-dessous).
 Stratégie à choisir : chargement couche par couche (48 noyaux `forwardVisit`) ou experts
 NVFP4 gardés natifs (mmap 22,9 Go) + déquant dans le graphe.
 
-## Phase 4 — Inférence
-- KV cache 48 visites × (K,V) 1024 bf16 ; sconv state 48 × 3 × 6656.
-- Prefill + decode, sampling (temp/top-p), chat template jinja du GGUF.
+## Phase 4 — Inférence (FAIT, 2026-11-25)
+- CLI `inkling` layer-wise (`src/main.zig`) : 48 visites exécutées une par une, poids d'une
+  couche physique (~2,2 Go bf16) chargés à la volée depuis le GGUF mmapé (52 Go > RAM 30 Go).
+  7 variantes XLA compilées (is_global x new_block x has_query x has_loop), poids re-bakés
+  par visite. KV cache + sconv chaînés entre visites ; msgs de boucle via `msgsFn`.
+- Platform CPU 1 device (sinon mesh 4 partitions -> buffers répliqués x4 -> OOM).
+- Premier run réel OK : tokens "1 2 3 4" -> logits {s=4, voc=200058} dumpés.
 
-## Phase 5 — Validation
-- Logits vs llama.cpp mainline (UD-Q8_K_XL) sur prompts fixes ; puis ppl ; puis bench
-  tok/s et mémoire vs llama.cpp (mêmes réglages).
+## Phase 5 — Validation (en cours, 2026-11-25)
+- Référence : llama.cpp master (commit 29b52d3, arch inkling2_loop) buildé CPU dans
+  /home/nico/llama-build, outil /tmp/dump_logits.cpp (prefill ids bruts, dump logits dernier
+  token). Le build Unsloth préexistant (883286076) ne connaît que l'arch `inkling2`.
+- 1er comparatif : écart énorme (r=0.07) -> bugs trouvés et corrigés :
+  1. déquant NVFP4/MXFP4 : vrai layout ggml = bloc 64 elems/36 o (4 scales UE4M3 + 32 o
+     nibbles, low nibble -> moitié basse), pas 256/144 (c1839cc) ;
+  2. routage MoE : topk sur sigmoid(logits)+biais, poids = sigmoid(logits) non biaisés x8 ;
+  3. couches SWA avec messages : normer chaque entrée Q/K/V séparément ;
+  4. clip L2 : facteur = threshold/(||x||+1e-6) clampé [0,1].
+- Re-comparaison en cours (run7). GGUF patchés loop.count=2 dispo pour bissection
+  (Inkling-2-Mini-UD-Q8_K_XL-loop2.gguf).
 
 ## Phase 6 — Optimisation (plus tard)
+- LoopCD (arXiv 2610.02185) : contrastive decoding depuis la 1re passe de boucle
+  (h' = h_R + ω(h_R − h_1) avant coda), + halving des passes (loop_count 3 -> 2, voire 1)
+  = -22..48% FLOPs. `--loop-count N` déjà en CLI. Voir scratchpad handoff.
 - Poids quantifiés en mémoire + noyaux NVFP4/MXFP8 ; pipeline vision (mmproj-F16.gguf) ;
   varloop (loop.varying) hors scope v1.
+
