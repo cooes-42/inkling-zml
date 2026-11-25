@@ -200,6 +200,21 @@ const MsgQ = struct {
     msg_query: zml.Tensor, // {.ctrl=4, .d} f32
 };
 
+/// Dump le buffer cur (bf16 {.s,.d}) après une visite, pour comparaison couche à couche
+/// avec les tenseurs l_out-<slot> dumpés par llama.cpp (LLAMA_DUMP_TENSORS).
+fn dumpVisit(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, visit: u32, cur_buf: *const zml.Buffer) !void {
+    const sl = try cur_buf.toSliceAlloc(allocator, io);
+    defer sl.free(allocator);
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/l_out_{d}.bin", .{ dir, visit });
+    const f = try std.Io.Dir.createFile(.cwd(), io, path, .{});
+    defer f.close(io);
+    var wbuf: [4096]u8 = undefined;
+    var w = f.writer(io, &wbuf);
+    try w.interface.writeAll(sl.bytes);
+    try w.interface.flush();
+}
+
 fn loadMsgQuery(ctx: *const Ctx, phys: u32) !zml.Buffer {
     const v = ctx.store.view().withPrefix("blk").withLayer(phys);
     var w = MsgQ{ .msg_query = v.createTensor("loop_msg_query.weight", .{ .ctrl, .d }, .replicated, .replicated) };
@@ -220,9 +235,11 @@ pub fn main(init: std.process.Init) !void {
     var tokens_str: ?[]const u8 = null;
     var dump_path: ?[]const u8 = null;
     var loop_count: ?u32 = null;
+    var dump_visits: ?[]const u8 = null;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--tokens")) tokens_str = args.next();
         if (std.mem.eql(u8, a, "--dump-logits")) dump_path = args.next();
+        if (std.mem.eql(u8, a, "--dump-visits")) dump_visits = args.next();
         if (std.mem.eql(u8, a, "--loop-count")) {
             if (args.next()) |v| loop_count = try std.fmt.parseInt(u32, v, 10);
         }
@@ -393,6 +410,7 @@ pub fn main(init: std.process.Init) !void {
         const v: u32 = @intCast(i);
         std.debug.print("visit {d}/{d} phys={d}\n", .{ v, cfg.n_visits, inkling2.visitPhys(cfg, v) });
         try runVisit(&ctx, v, inkling2.visitPhys(cfg, v), false, null, true, &cur_buf, pos_buf, idx_buf, &kv_buf, &sc_buf, &blocks_buf, &nblocks_buf);
+        if (dump_visits) |dv| try dumpVisit(init.io, allocator, dv, v, &cur_buf);
     }
     const prelude_buf = cur_buf; // handle du prélude, réutilisé au début de chaque passe > 0
 
@@ -429,6 +447,7 @@ pub fn main(init: std.process.Init) !void {
             const v: u32 = if (p == 0) ip else cfg.n_layers_phys + (p - 1) * core + @as(u32, @intCast(i));
             std.debug.print("visit {d}/{d} phys={d} pass={d}\n", .{ v, cfg.n_visits, inkling2.visitPhys(cfg, v), p });
             try runVisit(&ctx, v, inkling2.visitPhys(cfg, v), p > 0, msgs_list[i], !first, &cur_buf, pos_buf, idx_buf, &kv_buf, &sc_buf, &blocks_buf, &nblocks_buf);
+            if (dump_visits) |dv| try dumpVisit(init.io, allocator, dv, v, &cur_buf);
             first = false;
         }
     }
@@ -438,6 +457,7 @@ pub fn main(init: std.process.Init) !void {
         const v: u32 = @intCast(i);
         std.debug.print("visit {d}/{d} phys={d} (coda)\n", .{ v, cfg.n_visits, inkling2.visitPhys(cfg, v) });
         try runVisit(&ctx, v, @intCast(i), false, null, true, &cur_buf, pos_buf, idx_buf, &kv_buf, &sc_buf, &blocks_buf, &nblocks_buf);
+        if (dump_visits) |dv| try dumpVisit(init.io, allocator, dv, v, &cur_buf);
     }
     std.debug.print("all visits done\n", .{});
 
