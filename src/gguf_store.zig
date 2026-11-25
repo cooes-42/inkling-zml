@@ -150,7 +150,9 @@ fn loadOne(
             // quantifié -> bf16 host ; NVFP4 a besoin du tenseur `.scale` (f32 par expert)
             var scale_raw: ?[]const u8 = null;
             if (ti.ggml_type == .nvfp4) {
-                const scale_name = try std.fmt.allocPrint(allocator, "{s}.scale", .{name});
+                // convention GGUF : l'échelle s'appelle `<base>.scale` (sans le suffixe `.weight`)
+                const base = if (std.mem.endsWith(u8, name, ".weight")) name[0 .. name.len - ".weight".len] else name;
+                const scale_name = try std.fmt.allocPrint(allocator, "{s}.scale", .{base});
                 defer allocator.free(scale_name);
                 scale_raw = try g.tensorData(scale_name);
             }

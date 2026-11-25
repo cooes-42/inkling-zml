@@ -253,7 +253,8 @@ pub fn main(init: std.process.Init) !void {
         cfg.n_layers_phys, cfg.loop_start, cfg.loop_end, cfg.loop_count, cfg.n_visits, cfg.d, cfg.vocab,
     });
 
-    const platform = try zml.Platform.init(allocator, init.io, .cpu, .{});
+    // 1 device CPU : sinon le mesh réplique chaque buffer x4 (OOM)
+    const platform = try zml.Platform.init(allocator, init.io, .cpu, .{ .cpu = .{ .device_count = 1 } });
     const mesh = try platform.registerMesh("model", .mesh(.{ .model = .high_bandwidth }));
 
     // prototypes de tenseurs runtime
@@ -447,9 +448,10 @@ pub fn main(init: std.process.Init) !void {
     }, .{ .wait = true });
     std.debug.print("logits shape {f}\n", .{logits_buf.shape()});
 
-    const n = @divExact(logits_buf.shape().byteSize(), 4);
-    const vals = try logits_buf.getValue([]f32, init.io);
-    defer allocator.free(vals);
+    const sl = try logits_buf.toSliceAlloc(allocator, init.io);
+    defer sl.free(allocator);
+    const vals = sl.items(f32);
+    const n = vals.len;
     std.debug.print("logits len={d}\n", .{n});
     const last = vals[(seqlen - 1) * @as(usize, @intCast(cfg.vocab_unpadded)) ..];
     var top: [5]struct { id: usize, v: f32 } = undefined;
