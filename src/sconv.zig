@@ -16,20 +16,19 @@ pub const ConvResult = struct {
 };
 
 /// `cur` {.s, .c}, `weight` {.c, .kernel}, `dynamic` ?{.s, .kernel*.h} (taps dynamiques),
-/// état `st` indexé par visite `v`, canaux à l'offset `offset`.
+/// état `st` indexé par `st.layer_index` (scalaire u32 runtime), canaux à l'offset `offset`.
 pub fn convolve(
     cur: zml.Tensor,
     weight: zml.Tensor,
     dynamic: ?zml.Tensor,
     st: inkling2.SconvState,
-    v: usize,
     offset: i64,
 ) ConvResult {
     const kernel = weight.dim(.kernel);
     const c = cur.dim(.c);
     const s = cur.dim(.s);
 
-    var past = st.atVisit(v).sliceChannels(offset, c).rename(.{ .mix = .c }); // {.k = kernel-1, .c}
+    var past = st.sliceChannels(offset, c).rename(.{ .mix = .c }); // {.k = kernel-1, .c}
     const cur_t = cur.rename(.{ .s = .t }); // {.t=s, .c}
     past = past.rename(.{ .k = .t }); // {.t = kernel-1, .c}
     const x = zml.Tensor.concatenate(&.{ past, cur_t }, .t); // {.t = kernel-1+s, .c}
@@ -61,7 +60,7 @@ pub fn convolve(
 
     // nouvel état récurrent : derniers kernel-1 pas de x
     const new_past = x.slice(.t, .{ .start = s, .end = s + kernel - 1 }).rename(.{ .t = .k, .c = .mix }); // {.k, .mix}
-    const new_state = st.atVisit(v).updateChannels(offset, c, new_past);
+    const new_state = st.updateChannels(offset, c, new_past);
 
     const dyn_factor: i64 = if (dynamic != null) 2 else 1;
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dyn_factor * kernel + 1)));

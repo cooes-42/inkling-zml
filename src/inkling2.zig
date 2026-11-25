@@ -370,6 +370,9 @@ fn l2clip(x: zml.Tensor, threshold: f32, axis: anytype) zml.Tensor {
 }
 
 /// Entrée d'une visite (compilable seule pour le chargement couche par couche).
+/// Les champs hôte (new_block, cfg) sont baked à la compilation : une variante
+/// compilée par combinaison (is_global, new_block, has_query, has_loop).
+/// `kv.layer_index` / `sconv.layer_index` sont des scalaires u32 runtime.
 pub const VisitIn = struct {
     layer: Layer,
     loop: ?LoopCtrl, // présent si passe de boucle > 0 sur une couche du core
@@ -381,8 +384,14 @@ pub const VisitIn = struct {
     blocks: zml.Tensor, // {.nb=nb_max, .s, .d} zéro-paddé
     n_blocks: zml.Tensor, // scalaire u32
     msgs: ?zml.Tensor, // {.q=4, .s, .d} si passe de boucle
-    visit: u32,
+    new_block: bool, // hôte : phys % attn_res_block == 0
     cfg: Config,
+};
+
+/// Poids d'une visite, en préfixe de VisitIn (champs baked du Runner).
+pub const VisitWeights = struct {
+    layer: Layer,
+    loop: ?LoopCtrl,
 };
 
 pub const VisitOut = struct {
@@ -396,7 +405,6 @@ pub const VisitOut = struct {
 /// Forward d'une visite v, fidèle à inkling2.cpp build_layer.
 pub fn visitForward(inp: VisitIn) VisitOut {
     const cfg = inp.cfg;
-    const phys = visitPhys(cfg, inp.visit);
     const L = inp.layer;
     const global = L.is_global;
     const h = cfg.h;
@@ -454,8 +462,8 @@ pub fn visitForward(inp: VisitIn) VisitOut {
         break :blk t.reshape(.{ .s = s, .kernel = cfg.sconv_kernel, .h = hkv });
     } else null;
 
-    const kc = sconv.convolve(Kp, L.k_conv.rename(.{ .d_kv = .c }), dyn_k, inp.sconv, inp.visit, SconvState.k_off);
-    const vc = sconv.convolve(Vp, L.v_conv.rename(.{ .d_kv = .c }), dyn_v, kc.state, inp.visit, SconvState.v_off);
+    const kc = sconv.convolve(Kp, L.k_conv.rename(.{ .d_kv = .c }), dyn_k, inp.sconv, SconvState.k_off);
+    const vc = sconv.convolve(Vp, L.v_conv.rename(.{ .d_kv = .c }), dyn_v, kc.state, SconvState.v_off);
     var K = kc.out.splitAxis(.c, .{ .h = hkv, .hd = hd }); // {.s, .h, .hd}
     var V = vc.out.splitAxis(.c, .{ .h = hkv, .hd = hd });
 
@@ -472,7 +480,7 @@ pub fn visitForward(inp: VisitIn) VisitOut {
     }
 
     // 6. KV cache (K/V après sconv + clip/norm) puis biais relatif + sinks
-    var kv = inp.kv.atVisit(inp.visit).update(K, V, inp.token_index);
+    var kv = inp.kv.update(K, V, inp.token_index);
     const Kc = kv.keys().slice(.s, .{ .start = 0, .end = n_kv }).rename(.{ .s = .k }).transpose(.{ .h, .k, .hd }); // {.h, .k, .hd}
     const Vc = kv.values().slice(.s, .{ .start = 0, .end = n_kv }).rename(.{ .s = .k }).transpose(.{ .h, .k, .hd });
 
@@ -526,13 +534,13 @@ pub fn visitForward(inp: VisitIn) VisitOut {
     var a = attn.rename(.{ .q = .s }).transpose(.{ .s, .h, .hd }).merge(.{ .dout = .{ .h, .hd } }); // {.s, .dout=h*hd}
     a = a.mul(L.wqkv_gate.forward(inputs[0], a.dtype()).sigmoid());
     const wo_out = L.wo.forward(a.rename(.{ .dout = .d }), a.dtype()).rename(.{ .dout = .c }); // {.s, .c=d}
-    const ac = sconv.convolve(wo_out, L.attn_post_conv.rename(.{ .d = .c }), null, vc.state, inp.visit, SconvState.attn_post_off);
+    const ac = sconv.convolve(wo_out, L.attn_post_conv.rename(.{ .d = .c }), null, vc.state, SconvState.attn_post_off);
 
     // 9. residual par bloc de 6 : nouveau stream si phys % 6 == 0
     var blocks = inp.blocks;
     var n_blocks = inp.n_blocks;
     var cur2: zml.Tensor = undefined;
-    if (phys % cfg.attn_res_block == 0) {
+    if (inp.new_block) {
         blocks = inp.blocks.scatterSlices(
             .{ .nb = inp.n_blocks },
             inpSA.reshape(.{ .nb = 1, .s = s, .d = cfg.d }),
@@ -553,7 +561,7 @@ pub fn visitForward(inp: VisitIn) VisitOut {
     }
     f = rmsNormW(f, L.ffn_norm, cfg.rms_eps);
     f = moe.forward(f, L, cfg);
-    const fc = sconv.convolve(f.rename(.{ .d = .c }), L.ffn_post_conv.rename(.{ .d = .c }), null, ac.state, inp.visit, SconvState.ffn_post_off);
+    const fc = sconv.convolve(f.rename(.{ .d = .c }), L.ffn_post_conv.rename(.{ .d = .c }), null, ac.state, SconvState.ffn_post_off);
 
     return .{
         .cur = ffn_inp.add(fc.out.rename(.{ .c = .d })),
@@ -565,12 +573,14 @@ pub fn visitForward(inp: VisitIn) VisitOut {
 }
 
 pub const OutputIn = struct {
-    blocks: zml.Tensor,
-    n_blocks: zml.Tensor,
-    cur: zml.Tensor,
+    // poids en préfixe (champs baked du Runner)
     output: zml.Tensor, // {.voc, .d}
     output_norm: zml.Tensor,
     output_res_query: zml.Tensor,
+    // entrées runtime
+    blocks: zml.Tensor,
+    n_blocks: zml.Tensor,
+    cur: zml.Tensor,
     cfg: Config,
 };
 
@@ -588,6 +598,53 @@ pub fn outputForward(inp: OutputIn) OutputOut {
     logits = logits.scale(1.0 / cfg.final_softcap).tanh().scale(cfg.final_softcap); // softcap 30
     logits = logits.slice(.voc, .{ .start = 0, .end = cfg.vocab_unpadded }).convert(.f32).transpose(.{ .s, .voc }); // {.s, .voc}
     return .{ .logits = logits };
+}
+
+/// Nombre de blocs empilés pendant le prélude (visites 0..loop_start) :
+/// les phys % attn_res_block == 0 de [0, loop_start).
+pub fn preludeBlockCount(cfg: Config) u32 {
+    return (cfg.loop_start + cfg.attn_res_block - 1) / cfg.attn_res_block;
+}
+
+/// Embedding + norme d'entrée (compilable seul ; poids baked en préfixe).
+pub const EmbedIn = struct {
+    token_embd: zml.Tensor, // {.voc, .d} bf16
+    token_embd_norm: zml.Tensor, // {.d} f32
+    tokens: zml.Tensor, // {.s} u32
+    cfg: Config,
+};
+
+pub const EmbedOut = struct {
+    cur: zml.Tensor, // {.s, .d} bf16
+};
+
+pub fn embedFn(inp: EmbedIn) EmbedOut {
+    var cur = inp.token_embd.gather(.{ .voc = inp.tokens }, .{}).convert(.bf16); // {.s, .d}
+    cur = rmsNormW(cur, inp.token_embd_norm, inp.cfg.rms_eps);
+    return .{ .cur = cur };
+}
+
+/// Messages de boucle d'une passe : mix(bank, n_bank, bank_out, msg_query) avec
+/// bank = blocs [prelude_len+1, n_blocks) de la passe précédente. Compilable seul.
+pub const MsgsIn = struct {
+    blocks: zml.Tensor, // {.nb=nb_max, .s, .d}
+    n_blocks: zml.Tensor, // scalaire u32
+    cur: zml.Tensor, // {.s, .d} = sortie de la passe précédente
+    msg_query: zml.Tensor, // {.ctrl=4, .d} f32
+    cfg: Config,
+};
+
+pub const MsgsOut = struct {
+    msgs: zml.Tensor, // {.q=4, .s, .d} f32
+};
+
+pub fn msgsFn(inp: MsgsIn) MsgsOut {
+    const cfg = inp.cfg;
+    const start: i64 = @as(i64, @intCast(preludeBlockCount(cfg))) + 1;
+    const bank = inp.blocks.slice(.nb, .{ .start = start, .end = depth_mix.nb_max }); // {.nb = nb_max-start, .s, .d}
+    const n_bank = inp.n_blocks.subConstant(@intCast(start));
+    const msgs = depth_mix.mix(bank, n_bank, inp.cur, inp.msg_query.rename(.{ .ctrl = .q })); // {.q, .s, .d}
+    return .{ .msgs = msgs };
 }
 
 pub const ForwardOut = struct {
@@ -638,7 +695,7 @@ pub fn forward(m: Model, tokens: zml.Tensor, pos: zml.Tensor, token_index: zml.T
                 .blocks = depth_mix.blocksTensor(host_, s_, cfg_.d, .bf16),
                 .n_blocks = zml.Tensor.scalar(@as(u32, @intCast(host_.len)), .u32),
                 .msgs = msgs_,
-                .visit = v,
+                .new_block = visitPhys(cfg_, v) % cfg_.attn_res_block == 0,
                 .cfg = cfg_,
             });
         }
@@ -663,6 +720,8 @@ pub fn forward(m: Model, tokens: zml.Tensor, pos: zml.Tensor, token_index: zml.T
                 host_[host_len_.*] = cur_.*;
                 host_len_.* += 1;
             }
+            kv_.* = kv_.*.atVisit(v);
+            sc_.* = sc_.*.atVisit(v);
             const o = run(m_, v, cur_.*, pos_, idx_, kv_.*, sc_.*, host_[0..host_len_.*], loop_, msgs_, cfg_);
             cur_.* = o.cur;
             kv_.* = o.kv;
