@@ -369,43 +369,40 @@ fn l2clip(x: zml.Tensor, threshold: f32, axis: anytype) zml.Tensor {
     return x.mul(s.broad(x.shape()));
 }
 
-/// Streams des blocs de 6 visites (attn_res) — taille max 48/6+1 = 9.
-pub const Blocks = struct {
-    items: [16]zml.Tensor = undefined,
-    len: usize = 0,
-    pub fn append(self: *Blocks, t: zml.Tensor) void {
-        self.items[self.len] = t;
-        self.len += 1;
-    }
-    pub fn slice(self: *const Blocks) []const zml.Tensor {
-        return self.items[0..self.len];
-    }
-};
-
-pub const VisitCtx = struct {
-    pos: zml.Tensor, // {.s} i64 positions absolues des queries
-    token_index: zml.Tensor, // {.s} u32 positions d'écriture dans le KV cache
+/// Entrée d'une visite (compilable seule pour le chargement couche par couche).
+pub const VisitIn = struct {
+    layer: Layer,
+    loop: ?LoopCtrl, // présent si passe de boucle > 0 sur une couche du core
+    cur: zml.Tensor, // {.s, .d}
+    pos: zml.Tensor, // {.s} i64
+    token_index: zml.Tensor, // {.s} u32
     kv: KvCache,
     sconv: SconvState,
-    blocks: *Blocks,
+    blocks: zml.Tensor, // {.nb=nb_max, .s, .d} zéro-paddé
+    n_blocks: zml.Tensor, // scalaire u32
+    msgs: ?zml.Tensor, // {.q=4, .s, .d} si passe de boucle
+    visit: u32,
+    cfg: Config,
 };
 
 pub const VisitOut = struct {
-    cur: zml.Tensor, // {.s, .d}
+    cur: zml.Tensor,
     kv: KvCache,
     sconv: SconvState,
+    blocks: zml.Tensor,
+    n_blocks: zml.Tensor,
 };
 
-/// Forward d'une visite v (0..47), fidèle à inkling2.cpp build_layer.
-/// `msgs` : {.ctrl=4, .s, .d} présents uniquement pour les passes 1/2 des couches 6..17.
-pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml.Tensor) VisitOut {
-    const cfg = m.config;
-    const phys = visitPhys(cfg, v);
-    const L = m.layers[phys];
+/// Forward d'une visite v, fidèle à inkling2.cpp build_layer.
+pub fn visitForward(inp: VisitIn) VisitOut {
+    const cfg = inp.cfg;
+    const phys = visitPhys(cfg, inp.visit);
+    const L = inp.layer;
     const global = L.is_global;
     const h = cfg.h;
     const hkv = cfg.hkv;
     const hd = cfg.hd;
+    const cur = inp.cur;
     const s = cur.dim(.s);
     const n_kv = s; // v1 prefill : tous les tokens sont dans le cache
 
@@ -414,7 +411,7 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
     // 1. attn_res : mix over depth (blk.0 n'a pas de query)
     var inputs = [3]zml.Tensor{ cur, cur, cur };
     if (L.attn_res_query) |q| {
-        const mixed = depth_mix.mix(ctx.blocks.slice(), cur, q).convert(cur.dtype()); // {.q, .s, .d}
+        const mixed = depth_mix.mix(inp.blocks, inp.n_blocks, cur, q).convert(cur.dtype()); // {.q, .s, .d}
         if (global) {
             for (0..3) |j| inputs[j] = mixed.slice(.q, .{ .start = @intCast(j), .end = @intCast(j + 1) }).squeeze(.q);
         } else {
@@ -424,8 +421,8 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
     }
 
     // 2. contrôle de boucle (passes 1/2) : messages Q, K, V
-    if (msgs) |ms| {
-        const lc = m.loop_ctrl[phys - cfg.loop_start];
+    if (inp.msgs) |ms| {
+        const lc = inp.loop.?;
         for (0..3) |j| {
             const msg = ms.slice(.q, .{ .start = @intCast(j), .end = @intCast(j + 1) }).squeeze(.q);
             inputs[j] = loop_ctrl_mod.control(inputs[j], msg, lc, j);
@@ -457,8 +454,8 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
         break :blk t.reshape(.{ .s = s, .kernel = cfg.sconv_kernel, .h = hkv });
     } else null;
 
-    const kc = sconv.convolve(Kp, L.k_conv.rename(.{ .d_kv = .c }), dyn_k, ctx.sconv, v, SconvState.k_off);
-    const vc = sconv.convolve(Vp, L.v_conv.rename(.{ .d_kv = .c }), dyn_v, kc.state, v, SconvState.v_off);
+    const kc = sconv.convolve(Kp, L.k_conv.rename(.{ .d_kv = .c }), dyn_k, inp.sconv, inp.visit, SconvState.k_off);
+    const vc = sconv.convolve(Vp, L.v_conv.rename(.{ .d_kv = .c }), dyn_v, kc.state, inp.visit, SconvState.v_off);
     var K = kc.out.splitAxis(.c, .{ .h = hkv, .hd = hd }); // {.s, .h, .hd}
     var V = vc.out.splitAxis(.c, .{ .h = hkv, .hd = hd });
 
@@ -468,14 +465,14 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
     V = zml.nn.rmsNorm(V.convert(.f32), .hd, cfg.rms_eps).convert(V.dtype());
     R = l2clip(R.mul(L.rel_clip.convert(R.dtype()).broad(R.shape())), cfg.rel_clip, .d_rel);
     if (global) {
-        const tau = ctx.pos.convert(.f32).addConstant(1).scale(1.0 / cfg.log_scale_floor)
+        const tau = inp.pos.convert(.f32).addConstant(1).scale(1.0 / cfg.log_scale_floor)
             .maximum(zml.Tensor.scalar(1.0, .f32)).log().scale(cfg.log_scale_alpha).addConstant(1); // {.s}
         Q = Q.mul(tau.convert(Q.dtype()).broad(Q.shape()));
         R = R.mul(tau.convert(R.dtype()).broad(R.shape()));
     }
 
     // 6. KV cache (K/V après sconv + clip/norm) puis biais relatif + sinks
-    var kv = ctx.kv.atVisit(v).update(K, V, ctx.token_index);
+    var kv = inp.kv.atVisit(inp.visit).update(K, V, inp.token_index);
     const Kc = kv.keys().slice(.s, .{ .start = 0, .end = n_kv }).rename(.{ .s = .k }).transpose(.{ .h, .k, .hd }); // {.h, .k, .hd}
     const Vc = kv.values().slice(.s, .{ .start = 0, .end = n_kv }).rename(.{ .s = .k }).transpose(.{ .h, .k, .hd });
 
@@ -490,7 +487,7 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
 
     // positions relatives {k, q} clampées à [0, extent]
     const kp = zml.Tensor.arange(.{ .start = 0, .end = n_kv }, .i64).withTags(.{.k});
-    const qp = ctx.pos.withTags(.{ .q });
+    const qp = inp.pos.withTags(.{ .q });
     const kq_shape = zml.Shape.init(.{ .k = n_kv, .q = s }, .i64);
     const rel = qp.broad(kq_shape).sub(kp.broad(kq_shape)); // {.k, .q} = pos_q - pos_k
     const rel_pos = rel.clamp(zml.Tensor.scalar(0, .i64), zml.Tensor.scalar(extent, .i64)).convert(.i32);
@@ -511,9 +508,10 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
         zml.Tensor.constant(zml.DataType.f32.zero()).broad(zml.Shape.init(.{ .q = s, .k = n_kv }, .f32)),
         zml.Tensor.constant(zml.DataType.Value.init(.f32, -std.math.inf(f32))).broad(zml.Shape.init(.{ .q = s, .k = n_kv }, .f32)),
     ); // {.q, .k}
+
     // sdpa splitte q en {h=hkv, hq} : on replie kq_b (par tête Q) en {h=hkv, hq, q, k}
     const kq_b_h = kq_b.splitAxis(.h, .{ .h = hkv, .hq = @divExact(h, hkv) }); // {.h=hkv, .hq, .q, .k}
-    // sdpa ajoute le masque en bf16 (dtype de q) avant de passer en f32 : on convertit
+    // sdpa ajoute le masque dans le dtype de q (avant de passer en f32)
     const attn_mask = mask.broad(kq_b_h.shape()).add(kq_b_h).convert(Q.dtype()); // {.h=hkv, .hq, .q, .k}
 
     // 7. attention sdpa : softmax(QK/√hd + mask + kq_b) · V
@@ -528,12 +526,19 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
     var a = attn.rename(.{ .q = .s }).transpose(.{ .s, .h, .hd }).merge(.{ .dout = .{ .h, .hd } }); // {.s, .dout=h*hd}
     a = a.mul(L.wqkv_gate.forward(inputs[0], a.dtype()).sigmoid());
     const wo_out = L.wo.forward(a.rename(.{ .dout = .d }), a.dtype()).rename(.{ .dout = .c }); // {.s, .c=d}
-    const ac = sconv.convolve(wo_out, L.attn_post_conv.rename(.{ .d = .c }), null, vc.state, v, SconvState.attn_post_off);
+    const ac = sconv.convolve(wo_out, L.attn_post_conv.rename(.{ .d = .c }), null, vc.state, inp.visit, SconvState.attn_post_off);
 
-    // 9. residual par bloc de 6
+    // 9. residual par bloc de 6 : nouveau stream si phys % 6 == 0
+    var blocks = inp.blocks;
+    var n_blocks = inp.n_blocks;
     var cur2: zml.Tensor = undefined;
     if (phys % cfg.attn_res_block == 0) {
-        ctx.blocks.append(inpSA);
+        blocks = inp.blocks.scatterSlices(
+            .{ .nb = inp.n_blocks },
+            inpSA.reshape(.{ .nb = 1, .s = s, .d = cfg.d }),
+            .{ .update_fn = zml.Tensor.ScatterOpts.override },
+        );
+        n_blocks = inp.n_blocks.addConstant(1);
         cur2 = ac.out.rename(.{ .c = .d });
     } else {
         cur2 = inpSA.add(ac.out.rename(.{ .c = .d }));
@@ -541,27 +546,181 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
 
     // 10. FFN MoE
     const ffn_inp = cur2;
-    var f = depth_mix.mix(ctx.blocks.slice(), cur2, L.ffn_res_query).slice(.q, .{ .start = 0, .end = 1 }).squeeze(.q).convert(cur2.dtype()); // {.s, .d}
-    if (msgs) |ms| {
+    var f = depth_mix.mix(blocks, n_blocks, cur2, L.ffn_res_query).slice(.q, .{ .start = 0, .end = 1 }).squeeze(.q).convert(cur2.dtype()); // {.s, .d}
+    if (inp.msgs) |ms| {
         const msg = ms.slice(.q, .{ .start = 3, .end = 4 }).squeeze(.q);
-        f = loop_ctrl_mod.control(f, msg, m.loop_ctrl[phys - cfg.loop_start], 3);
+        f = loop_ctrl_mod.control(f, msg, inp.loop.?, 3);
     }
     f = rmsNormW(f, L.ffn_norm, cfg.rms_eps);
     f = moe.forward(f, L, cfg);
-    const fc = sconv.convolve(f.rename(.{ .d = .c }), L.ffn_post_conv.rename(.{ .d = .c }), null, ac.state, v, SconvState.ffn_post_off);
+    const fc = sconv.convolve(f.rename(.{ .d = .c }), L.ffn_post_conv.rename(.{ .d = .c }), null, ac.state, inp.visit, SconvState.ffn_post_off);
 
     return .{
         .cur = ffn_inp.add(fc.out.rename(.{ .c = .d })),
         .kv = kv,
         .sconv = fc.state,
+        .blocks = blocks,
+        .n_blocks = n_blocks,
     };
+}
+
+pub const OutputIn = struct {
+    blocks: zml.Tensor,
+    n_blocks: zml.Tensor,
+    cur: zml.Tensor,
+    output: zml.Tensor, // {.voc, .d}
+    output_norm: zml.Tensor,
+    output_res_query: zml.Tensor,
+    cfg: Config,
+};
+
+pub const OutputOut = struct {
+    logits: zml.Tensor, // {.s, .voc_unpadded} f32
+};
+
+/// Sortie modèle : mix(blocks, cur, output_res_query) -> output_norm -> lm_head -> softcap -> unpadded.
+pub fn outputForward(inp: OutputIn) OutputOut {
+    const cfg = inp.cfg;
+    var out = depth_mix.mix(inp.blocks, inp.n_blocks, inp.cur, inp.output_res_query)
+        .slice(.q, .{ .start = 0, .end = 1 }).squeeze(.q).convert(inp.cur.dtype()); // {.s, .d}
+    out = rmsNormW(out, inp.output_norm, cfg.rms_eps);
+    var logits = inp.output.dot(out, .d); // {.voc, .s}
+    logits = logits.scale(1.0 / cfg.final_softcap).tanh().scale(cfg.final_softcap); // softcap 30
+    logits = logits.slice(.voc, .{ .start = 0, .end = cfg.vocab_unpadded }).convert(.f32).transpose(.{ .s, .voc }); // {.s, .voc}
+    return .{ .logits = logits };
 }
 
 pub const ForwardOut = struct {
     logits: zml.Tensor, // {.s, .voc_unpadded} f32
     kv: KvCache,
     sconv: SconvState,
+    blocks: zml.Tensor,
+    n_blocks: zml.Tensor,
 };
+
+/// Forward monolithique (tests) : 48 visites + sortie.
+pub fn forward(m: Model, tokens: zml.Tensor, pos: zml.Tensor, token_index: zml.Tensor, kv: KvCache, sconv_state: SconvState) ForwardOut {
+    const cfg = m.config;
+    const s = tokens.dim(.s);
+
+    var cur = m.token_embd.gather(.{ .voc = tokens }, .{}).convert(.bf16); // {.s, .d}
+    cur = rmsNormW(cur, m.token_embd_norm, cfg.rms_eps);
+
+    // tracking host des blocs (le graphe est déroulé à la compilation : host_len est connu)
+    var host_blocks: [depth_mix.nb_max]zml.Tensor = undefined;
+    var host_len: usize = 0;
+    var kv_c = kv;
+    var sc = sconv_state;
+
+    const run = struct {
+        fn call(
+            m_: Model,
+            v: u32,
+            cur_: zml.Tensor,
+            pos_: zml.Tensor,
+            idx_: zml.Tensor,
+            kv_: KvCache,
+            sc_: SconvState,
+            host_: []const zml.Tensor,
+            loop_: ?LoopCtrl,
+            msgs_: ?zml.Tensor,
+            cfg_: Config,
+        ) VisitOut {
+            const s_ = cur_.dim(.s);
+            return visitForward(.{
+                .layer = m_.layers[visitPhys(cfg_, v)],
+                .loop = loop_,
+                .cur = cur_,
+                .pos = pos_,
+                .token_index = idx_,
+                .kv = kv_,
+                .sconv = sc_,
+                .blocks = depth_mix.blocksTensor(host_, s_, cfg_.d, .bf16),
+                .n_blocks = zml.Tensor.scalar(@as(u32, @intCast(host_.len)), .u32),
+                .msgs = msgs_,
+                .visit = v,
+                .cfg = cfg_,
+            });
+        }
+    }.call;
+
+    const doVisit = struct {
+        fn apply(
+            m_: Model,
+            v: u32,
+            cur_: *zml.Tensor,
+            kv_: *KvCache,
+            sc_: *SconvState,
+            host_: []zml.Tensor,
+            host_len_: *usize,
+            loop_: ?LoopCtrl,
+            msgs_: ?zml.Tensor,
+            cfg_: Config,
+            pos_: zml.Tensor,
+            idx_: zml.Tensor,
+        ) void {
+            if (visitPhys(cfg_, v) % cfg_.attn_res_block == 0) {
+                host_[host_len_.*] = cur_.*;
+                host_len_.* += 1;
+            }
+            const o = run(m_, v, cur_.*, pos_, idx_, kv_.*, sc_.*, host_[0..host_len_.*], loop_, msgs_, cfg_);
+            cur_.* = o.cur;
+            kv_.* = o.kv;
+            sc_.* = o.sconv;
+        }
+    }.apply;
+
+    // prelude : visites 0..loop_start
+    for (0..cfg.loop_start) |v| {
+        doVisit(m, @intCast(v), &cur, &kv_c, &sc, &host_blocks, &host_len, null, null, cfg, pos, token_index);
+    }
+    const prelude = cur;
+    const prelude_len = host_len;
+
+    // passes sur le core [loop_start, loop_end)
+    const core = cfg.loop_end - cfg.loop_start;
+    for (0..cfg.loop_count) |pass_usize| {
+        const pass: u32 = @intCast(pass_usize);
+        var bank_items: []const zml.Tensor = &.{};
+        var bank_out = cur;
+        if (pass > 0) {
+            // bank = blocs après le premier bloc du core + sortie de la passe précédente
+            bank_items = host_blocks[prelude_len + 1 .. host_len];
+            bank_out = cur;
+            cur = prelude;
+            host_len = prelude_len;
+        }
+        for (0..core) |i_usize| {
+            const i: u32 = @intCast(i_usize);
+            const ip: u32 = cfg.loop_start + i;
+            const v: u32 = if (pass == 0) ip else cfg.n_layers_phys + (pass - 1) * core + i;
+            const has_msgs = pass > 0;
+            const bank_t = depth_mix.blocksTensor(bank_items, s, cfg.d, .bf16);
+            const msgs: ?zml.Tensor = if (has_msgs)
+                depth_mix.mix(bank_t, zml.Tensor.scalar(@as(u32, @intCast(bank_items.len)), .u32), bank_out, m.loop_ctrl[ip - cfg.loop_start].msg_query.rename(.{ .ctrl = .q }))
+            else
+                null;
+            const lc: ?LoopCtrl = if (has_msgs) m.loop_ctrl[ip - cfg.loop_start] else null;
+            doVisit(m, v, &cur, &kv_c, &sc, &host_blocks, &host_len, lc, msgs, cfg, pos, token_index);
+        }
+    }
+
+    // coda : visites loop_end..n_layers_phys
+    for (cfg.loop_end..cfg.n_layers_phys) |v| {
+        doVisit(m, @intCast(v), &cur, &kv_c, &sc, &host_blocks, &host_len, null, null, cfg, pos, token_index);
+    }
+
+    const out = outputForward(.{
+        .blocks = depth_mix.blocksTensor(host_blocks[0..host_len], s, cfg.d, .bf16),
+        .n_blocks = zml.Tensor.scalar(@as(u32, @intCast(host_len)), .u32),
+        .cur = cur,
+        .output = m.output,
+        .output_norm = m.output_norm,
+        .output_res_query = m.output_res_query,
+        .cfg = cfg,
+    });
+    return .{ .logits = out.logits, .kv = kv_c, .sconv = sc, .blocks = depth_mix.blocksTensor(host_blocks[0..host_len], s, cfg.d, .bf16), .n_blocks = zml.Tensor.scalar(@as(u32, @intCast(host_len)), .u32) };
+}
 
 /// Wrapper à un seul argument struct pour zml.FnExe (qui exige une input struct unique).
 pub const ForwardInput = struct {
@@ -578,73 +737,6 @@ pub const ForwardInput = struct {
 pub fn forwardFn(inp: ForwardInput) ForwardOut {
     return forward(inp.m, inp.tokens, inp.pos, inp.token_index, inp.kv, inp.sconv);
 }
-
-/// Forward complet : 48 visites + sortie. tokens {.s} u32, pos/token_index {.s}.
-pub fn forward(m: Model, tokens: zml.Tensor, pos: zml.Tensor, token_index: zml.Tensor, kv: KvCache, sconv_state: SconvState) ForwardOut {
-    const cfg = m.config;
-    var blocks = Blocks{};
-    var ctx = VisitCtx{ .pos = pos, .token_index = token_index, .kv = kv, .sconv = sconv_state, .blocks = &blocks };
-
-    // embedding + token_embd_norm (texte uniquement, D4)
-    var cur = m.token_embd.gather(.{ .voc = tokens }, .{}).convert(.bf16); // {.s, .d}
-    cur = rmsNormW(cur, m.token_embd_norm, cfg.rms_eps);
-
-    // prelude : visites 0..5
-    for (0..cfg.loop_start) |v| {
-        const o = forwardVisit(m, @intCast(v), cur, ctx, null);
-        cur = o.cur;
-        ctx.kv = o.kv;
-        ctx.sconv = o.sconv;
-    }
-    const prelude = cur;
-    const prelude_blocks_len = blocks.len;
-
-    // passes sur le core [6, 18)
-    const core = cfg.loop_end - cfg.loop_start;
-    for (0..cfg.loop_count) |pass_usize| {
-        const pass: u32 = @intCast(pass_usize);
-        var bank: []const zml.Tensor = &.{};
-        var bank_out: zml.Tensor = undefined;
-        if (pass > 0) {
-            bank = blocks.items[prelude_blocks_len + 1 .. blocks.len];
-            bank_out = cur;
-            cur = prelude;
-            blocks.len = prelude_blocks_len;
-        }
-        for (0..core) |i_usize| {
-            const i: u32 = @intCast(i_usize);
-            const ip: u32 = cfg.loop_start + i;
-            const v: u32 = if (pass == 0) ip else cfg.n_layers_phys + (pass - 1) * core + i;
-            const msgs: ?zml.Tensor = if (pass > 0)
-                depth_mix.mix(bank, bank_out, m.loop_ctrl[ip - cfg.loop_start].msg_query.rename(.{ .ctrl = .q })) // {.q=4, .s, .d}
-            else
-                null;
-            const o = forwardVisit(m, v, cur, ctx, msgs);
-            cur = o.cur;
-            ctx.kv = o.kv;
-            ctx.sconv = o.sconv;
-        }
-    }
-
-    // coda : visites 18..23
-    for (cfg.loop_end..cfg.n_layers_phys) |v| {
-        const o = forwardVisit(m, @intCast(v), cur, ctx, null);
-        cur = o.cur;
-        ctx.kv = o.kv;
-        ctx.sconv = o.sconv;
-    }
-
-    // sortie : mix + output_norm + lm_head + softcap + vocab unpadded
-    var out = depth_mix.mix(blocks.slice(), cur, m.output_res_query).slice(.q, .{ .start = 0, .end = 1 }).squeeze(.q).convert(cur.dtype()); // {.s, .d}
-    out = rmsNormW(out, m.output_norm, cfg.rms_eps);
-    var logits = m.output.dot(out, .d); // {.voc, .s}
-    logits = logits.scale(1.0 / cfg.final_softcap).tanh().scale(cfg.final_softcap); // softcap 30
-    logits = logits.slice(.voc, .{ .start = 0, .end = cfg.vocab_unpadded }).convert(.f32).transpose(.{ .s, .voc }); // {.s, .voc}
-
-    return .{ .logits = logits, .kv = ctx.kv, .sconv = ctx.sconv };
-}
-
-// ---------------------------------------------------------------------------
 // Constructeur aléatoire (tests d'intégration du graphe sans GGUF).
 // ---------------------------------------------------------------------------
 
