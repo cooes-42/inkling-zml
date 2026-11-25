@@ -5,24 +5,35 @@
 - Layout GGUF parsé : `docs/gguf-mainline-layout.md`
 - Décisions : `docs/decisions.md`
 
-## Phase 2 — Loader GGUF en Zig (prochaine étape)
-1. Parser binaire GGUF v3 : magic/version, KV metadata (tous types 0..12), tensor infos
-   (name, n_dims, dims u64, type u32, offset u64), alignement 32 o.
-2. `TensorStore` ZML au-dessus du mmap : `createTensor(name, axes)` résout offset/type/dims.
-3. Déquant → bf16 : F32/BF16 natifs ; NVFP4 (E4M3 × block-scale E4M3 × expert-scale F32) ;
-   Q8_K, Q4_K, IQ* pour les autres quants (v1 : au moins NVFP4 + natifs, le reste ensuite).
-4. Tokenizer : `zml.tokenizer` + `tokenizer.json` HF ; pre-tokenizer `inkling2`.
+## Phase 2 — Loader GGUF en Zig (fait, 2026-11-24)
+1. Parser binaire GGUF v3 : fait (`src/gguf.zig`), validé sur les vrais fichiers
+   (`gguf_dump`, 744 tenseurs mainline).
+2. `TensorStore` ZML au-dessus du mmap : fait (`src/gguf_store.zig`, `registryFromGguf` +
+   `loadAll` déquant bf16 host).
+3. Déquant → bf16 : F32/F16/BF16/Q8_0/Q8_K/NVFP4/MXFP4 faits ; K-quants et IQ* restent
+   (pour les builds UD racine, D13).
+4. Tokenizer : **non branché** — `zml.tokenizer` exclu du shim `src/zml.zig` (sentencepiece
+   cassé en C++ modules). v1 : tokens passés en CLI. À faire : parser `tokenizer.json` HF
+   nous-mêmes (pre-tokenizer o200k_base + ignore_merges).
 
-## Phase 3 — Model struct ZML
-1. `Inkling2Loop` : embeddings, 24 couches physiques, lm_head, res queries, output.
-2. Visite = (couche physique, passe) ; graphe 48 visites, poids partagés, KV + sconv state
-   par visite.
-3. Attention : Q/K/V + rel (d_rel=16, extent 1024), clips L2 (qk 22.63, rel 8.0), value norm,
-   log-scale τ sur globales, sinks, masque SWA 1024 vs global, kq_b additif.
-4. sconv kernel 4 causal + taps dynamiques (globales) + residual scalé.
-5. attn_res / ffn_res / output_res : `mix` over depth (softmax 1/√H, requêtes apprises).
-6. Boucle : `mix` bank + `control` (LoRA rank 64, tanh gain/forget) entre passes.
-7. MoE : router F32 + biais, top-8 sigmoid × 8.0, SiTU(4.0, 25.0), experts NVFP4→bf16.
+## Phase 3 — Model struct ZML (en cours, 2026-11-24)
+Écrit et commité (`src/inkling2.zig` + `depth_mix/loop_ctrl/sconv/moe.zig`) :
+1. Model : embeddings, 24 couches, loop_ctrl[12], lm_head, res queries — mapping validé
+   (`inkling_dump` : 704 tenseurs résolus sur Mainline UD-Q8_K_XL).
+2. Graphe 48 visites (prelude 0..5, 3 passes sur 6..17, coda 18..23), poids partagés,
+   KV + sconv par visite — écrit (`forward`/`forwardVisit`).
+3. Attention Q/K/V + rel + clips L2 + value norm + τ + sinks + masque SWA/global + kq_b
+   additif via `zml.nn.sdpa` — écrit.
+4. sconv kernel 4 causal + taps dynamiques — écrit (`sconv.zig`).
+5. mix over depth (attn_res/ffn_res/output_res) — écrit (`depth_mix.zig`).
+6. Boucle mix bank + control LoRA rank 64 — écrit (`loop_ctrl.zig`).
+7. MoE manuel top-8 sigmoid ×8 + SiTU — écrit (`moe.zig`).
+Reste : test d'intégration mini `//src:inkling2_test` à rendre vert (debug shapes ZML en
+cours), puis inférence réelle (voir blocage RAM ci-dessous).
+
+⚠ Blocage RAM (à traiter en phase 4) : poids déquantifiés = 52,1 Go bf16 > 30 Go RAM.
+Stratégie à choisir : chargement couche par couche (48 noyaux `forwardVisit`) ou experts
+NVFP4 gardés natifs (mmap 22,9 Go) + déquant dans le graphe.
 
 ## Phase 4 — Inférence
 - KV cache 48 visites × (K,V) 1024 bf16 ; sconv state 48 × 3 × 6656.
