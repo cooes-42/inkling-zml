@@ -365,9 +365,10 @@ pub fn rmsNormW(x: zml.Tensor, w: zml.Tensor, eps: f32) zml.Tensor {
 
 /// L2-clip : x * min(1, threshold/||x||) sur l'axe donné (inkling2.cpp graph::clip).
 fn l2clip(x: zml.Tensor, threshold: f32, axis: anytype) zml.Tensor {
+    // fidèle à inkling2.cpp clip : factor = threshold / (||x|| + 1e-6), clampé à [0,1]
     const n = x.powByConst(2).sum(axis).sqrt();
     const t = zml.Tensor.scalar(threshold, x.dtype());
-    const s = t.div(n.maximum(t));
+    const s = t.div(n.addConstant(1e-6)).minimum(zml.Tensor.scalar(1, x.dtype()));
     return x.mul(s.broad(x.shape()));
 }
 
@@ -444,6 +445,9 @@ pub fn visitForward(inp: VisitIn) VisitOut {
         inputs[0] = rmsNormW(inputs[0], L.q_inp_norm.?, cfg.rms_eps);
         inputs[1] = rmsNormW(inputs[1], L.k_inp_norm.?, cfg.rms_eps);
         inputs[2] = rmsNormW(inputs[2], L.v_inp_norm.?, cfg.rms_eps);
+    } else if (inp.msgs != null) {
+        // avec messages, les 3 entrées diffèrent après control : normer chacune
+        for (0..3) |j| inputs[j] = rmsNormW(inputs[j], L.attn_norm.?, cfg.rms_eps);
     } else {
         const n = rmsNormW(inputs[0], L.attn_norm.?, cfg.rms_eps);
         inputs = .{ n, n, n };
