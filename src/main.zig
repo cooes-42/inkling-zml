@@ -219,9 +219,13 @@ pub fn main(init: std.process.Init) !void {
     };
     var tokens_str: ?[]const u8 = null;
     var dump_path: ?[]const u8 = null;
+    var loop_count: ?u32 = null;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--tokens")) tokens_str = args.next();
         if (std.mem.eql(u8, a, "--dump-logits")) dump_path = args.next();
+        if (std.mem.eql(u8, a, "--loop-count")) {
+            if (args.next()) |v| loop_count = try std.fmt.parseInt(u32, v, 10);
+        }
     }
     if (tokens_str == null) {
         std.debug.print("--tokens requis\n", .{});
@@ -248,7 +252,8 @@ pub fn main(init: std.process.Init) !void {
     defer reg.deinit();
     var store = zml.io.TensorStore.fromRegistry(allocator, &reg, &.{});
 
-    const cfg = inkling2.Config.fromGguf(&gf.header, .{});
+    var cfg = inkling2.Config.fromGguf(&gf.header, .{});
+    if (loop_count) |lc| cfg = cfg.withLoopCount(lc);
     std.debug.print("config: layers={d} loop=[{d},{d})x{d} n_visits={d} d={d} voc={d}\n", .{
         cfg.n_layers_phys, cfg.loop_start, cfg.loop_end, cfg.loop_count, cfg.n_visits, cfg.d, cfg.vocab,
     });

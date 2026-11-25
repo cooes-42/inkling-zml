@@ -111,18 +111,29 @@ test "dequant q8_0 block" {
 }
 
 test "dequant nvfp4 block" {
-    // 16 scales E4M3 = 0x38 (1.0) + 128 o de nibbles 0x6 (E2M1 = 4.0)
-    var block: [144]u8 = undefined;
-    @memset(block[0..16], 0x38);
-    @memset(block[16..], 0x66);
-    var out: [256]f32 = undefined;
+    // block_nvfp4 ggml : 64 elems = 4 scales UE4M3 (0x40 -> 1.0) + 32 o de nibbles 0x66 (E2M1 6 -> 4.0)
+    var block: [36]u8 = undefined;
+    @memset(block[0..4], 0x40);
+    @memset(block[4..], 0x66);
+    var out: [64]f32 = undefined;
     try gguf.dequantBlock(.nvfp4, &block, &out, null);
     for (out) |v| try testing.expectEqual(@as(f32, 4.0), v);
 
     // avec scale globale F32 (tenseur .scale Unsloth) = 2.0
-    var out2: [256]f32 = undefined;
+    var out2: [64]f32 = undefined;
     try gguf.dequantTensor(.nvfp4, &block, &out2, 2.0);
     for (out2) |v| try testing.expectEqual(@as(f32, 8.0), v);
+
+    // layout des nibbles : sous-bloc s, octet j -> low: y[s*16+j], high: y[s*16+8+j]
+    var blk2: [36]u8 = undefined;
+    @memset(blk2[0..4], 0x40); // 1.0
+    @memset(blk2[4..], 0x21); // low=1 -> 0.5, high=2 -> 1.0
+    var out3: [64]f32 = undefined;
+    try gguf.dequantBlock(.nvfp4, &blk2, &out3, null);
+    try testing.expectEqual(@as(f32, 0.5), out3[0]);
+    try testing.expectEqual(@as(f32, 1.0), out3[8]);
+    try testing.expectEqual(@as(f32, 0.5), out3[16]); // sous-bloc 1, octet 0
+    try testing.expectEqual(@as(f32, 1.0), out3[16 + 8]);
 }
 
 test "fp conversions" {
@@ -137,22 +148,22 @@ test "fp conversions" {
 }
 
 test "dequantToBf16Host nvfp4 with per-expert scale" {
-    // 2 experts x 256 elems : bloc 0 expert 0, bloc 1 expert 1
-    var raw: [2 * 144]u8 = undefined;
-    @memset(raw[0..16], 0x38); // expert 0: scales 1.0
-    @memset(raw[16..144], 0x66); // nibbles 6 -> E2M1 4.0
-    @memset(raw[144 .. 144 + 16], 0x40); // expert 1: E4M3 0x40 = e=8 -> 2^(8-7)*(1+0)=2.0
-    @memset(raw[144 + 16 ..], 0x66);
+    // 2 experts x 64 elems (1 bloc de 36 o chacun)
+    var raw: [2 * 36]u8 = undefined;
+    @memset(raw[0..4], 0x40); // expert 0: scales UE4M3 0x40 = 1.0
+    @memset(raw[4..36], 0x66); // nibbles 6 -> E2M1 4.0
+    @memset(raw[36 .. 36 + 4], 0x40); // expert 1: 1.0
+    @memset(raw[36 + 4 ..], 0x66);
     var scale: [2]f32 = .{ 2.0, 3.0 };
-    var out: [512 * 2]u8 = undefined;
-    try gguf.dequantToBf16Host(.nvfp4, 512, &.{ 256, 1, 2 }, &raw, std.mem.asBytes(&scale), &out);
+    var out: [128 * 2]u8 = undefined;
+    try gguf.dequantToBf16Host(.nvfp4, 128, &.{ 64, 1, 2 }, &raw, std.mem.asBytes(&scale), &out);
     const o = std.mem.bytesAsSlice(u16, &out);
     // expert 0: 4.0 * 1.0 * 2.0 = 8.0 -> bf16 0x4100
     try testing.expectEqual(@as(u16, 0x4100), o[0]);
-    try testing.expectEqual(@as(u16, 0x4100), o[255]);
-    // expert 1: 4.0 * 2.0 * 3.0 = 24.0 -> bf16 0x41C0
-    try testing.expectEqual(@as(u16, 0x41C0), o[256]);
-    try testing.expectEqual(@as(u16, 0x41C0), o[511]);
+    try testing.expectEqual(@as(u16, 0x4100), o[63]);
+    // expert 1: 4.0 * 1.0 * 3.0 = 12.0 -> bf16 0x4140
+    try testing.expectEqual(@as(u16, 0x4140), o[64]);
+    try testing.expectEqual(@as(u16, 0x4140), o[127]);
 }
 
 test "block sizes" {
@@ -160,6 +171,9 @@ test "block sizes" {
     try testing.expectEqual(@as(?u32, 34), gguf.GgmlType.q8_0.blockBytes());
     try testing.expectEqual(@as(?u32, 256), gguf.GgmlType.q8_k.blockElems());
     try testing.expectEqual(@as(?u32, 292), gguf.GgmlType.q8_k.blockBytes());
-    try testing.expectEqual(@as(?u32, 144), gguf.GgmlType.nvfp4.blockBytes());
+    try testing.expectEqual(@as(?u32, 36), gguf.GgmlType.nvfp4.blockBytes());
+    try testing.expectEqual(@as(?u32, 64), gguf.GgmlType.nvfp4.blockElems());
+    try testing.expectEqual(@as(?u32, 17), gguf.GgmlType.mxfp4.blockBytes());
+    try testing.expectEqual(@as(?u32, 32), gguf.GgmlType.mxfp4.blockElems());
     try testing.expectEqual(@as(?u32, null), gguf.GgmlType.f32.blockElems());
 }

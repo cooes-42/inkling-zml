@@ -45,7 +45,8 @@ pub const GgmlType = enum(u32) {
             .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q8_1 => 32,
             .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k => 256,
             .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => 256,
-            .mxfp4, .nvfp4 => 256,
+            .mxfp4 => 32, // block_mxfp4 : 1 scale E8M0 + 16 octets nibbles
+            .nvfp4 => 64, // block_nvfp4 : 4 scales UE4M3 + 32 octets nibbles
             else => null,
         };
     }
@@ -65,8 +66,8 @@ pub const GgmlType = enum(u32) {
             .q5_k => 176,
             .q6_k => 210,
             .q8_k => 292,
-            .mxfp4 => 136, // 8 scales E8M0 + 128 o nibbles E2M1
-            .nvfp4 => 144, // 16 scales E4M3 + 128 o nibbles E2M1 (vérifié sur le fichier)
+            .mxfp4 => 17, // 1 scale E8M0 + 16 octets nibbles E2M1 (QK_MXFP4=32)
+            .nvfp4 => 36, // 4 scales UE4M3 + 32 octets nibbles E2M1 (QK_NVFP4=64)
             else => null, // TODO: tailles IQ depuis ggml-impl.h
         };
     }
@@ -390,6 +391,18 @@ pub fn e8m0ToF32(byte: u8) f32 {
     return std.math.pow(f32, 2.0, @as(f32, @floatFromInt(byte)) - 127.0);
 }
 
+/// UE4M3 non signé de ggml (ggml_ue4m3_to_fp32) : 0x00/0x7F -> 0, bit de signe ignoré, facteur 0.5.
+pub fn ue4m3ToF32(x: u8) f32 {
+    if (x == 0 or x == 0x7F) return 0.0;
+    const exp: u4 = @intCast((x >> 3) & 0xF);
+    const man: u3 = @intCast(x & 0x7);
+    const raw: f32 = if (exp == 0)
+        @as(f32, @floatFromInt(man)) * 0x1p-9
+    else
+        (1.0 + @as(f32, @floatFromInt(man)) / 8.0) * std.math.pow(f32, 2.0, @as(f32, @floatFromInt(exp)) - 7.0);
+    return raw * 0.5;
+}
+
 // ---------------------------------------------------------------------------
 // Déquantification par bloc. `block` = octets du bloc, `out` = elems du bloc.
 // ---------------------------------------------------------------------------
@@ -419,24 +432,36 @@ pub fn dequantBlock(ggml_type: GgmlType, block: []const u8, out: []f32, global_s
     }
 }
 
-/// NVFP4 : 16 scales E4M3 + 128 o nibbles ; MXFP4 : 8 scales E8M0 + 128 o nibbles.
-/// `global_scale` = facteur F32 externe (tenseur `.scale` pour NVFP4 Unsloth).
+/// NVFP4 (block_nvfp4) : 64 elems = 4 sous-blocs de 16, 4 scales UE4M3 (octets 0..3) + 32 octets
+/// de nibbles E2M1. MXFP4 (block_mxfp4) : 32 elems, 1 scale E8M0 + 16 octets de nibbles.
+/// Sous-bloc s, octet j (0..7) : nibble bas -> y[s*16+j], nibble haut -> y[s*16+8+j].
+/// `global_scale` = facteur F32 externe (tenseur `.scale` par expert pour NVFP4 Unsloth).
 fn dequantFp4(block: []const u8, out: []f32, scale_kind: enum { e4m3, e8m0 }, global_scale: ?f32) !void {
-    const n_scales: usize = if (scale_kind == .e4m3) 16 else 8;
-    const block_elems = n_scales * 16;
-    if (block.len < n_scales + block_elems / 2) return error.BlockTooSmall;
-    if (out.len < block_elems) return error.OutTooSmall;
     const gs = global_scale orelse 1.0;
-    for (0..n_scales) |b| {
-        const s = switch (scale_kind) {
-            .e4m3 => e4m3ToF32(block[b]),
-            .e8m0 => e8m0ToF32(block[b]),
-        } * gs;
-        for (0..16) |j| {
-            const byte = block[n_scales + b * 8 + j / 2];
-            const nibble: u4 = @intCast(if (j % 2 == 0) byte & 0xF else byte >> 4);
-            out[b * 16 + j] = e2m1ToF32(nibble) * s;
-        }
+    switch (scale_kind) {
+        .e4m3 => { // nvfp4 : 64 elems, 36 octets
+            if (block.len < 36) return error.BlockTooSmall;
+            if (out.len < 64) return error.OutTooSmall;
+            for (0..4) |s| {
+                const d = ue4m3ToF32(block[s]) * gs;
+                const base = s * 16;
+                for (0..8) |j| {
+                    const byte = block[4 + s * 8 + j];
+                    out[base + j] = e2m1ToF32(@intCast(byte & 0xF)) * d;
+                    out[base + 8 + j] = e2m1ToF32(@intCast(byte >> 4)) * d;
+                }
+            }
+        },
+        .e8m0 => { // mxfp4 : 32 elems, 17 octets
+            if (block.len < 17) return error.BlockTooSmall;
+            if (out.len < 32) return error.OutTooSmall;
+            const d = e8m0ToF32(block[0]) * gs;
+            for (0..16) |j| {
+                const byte = block[1 + j];
+                out[j] = e2m1ToF32(@intCast(byte & 0xF)) * d;
+                out[16 + j] = e2m1ToF32(@intCast(byte >> 4)) * d;
+            }
+        },
     }
 }
 
@@ -489,7 +514,7 @@ pub fn dequantToBf16Host(ggml_type: GgmlType, elems: u64, dims: []const u64, raw
             }
         },
         .nvfp4, .mxfp4 => {
-            const be: u64 = 256;
+            const be: u64 = ggml_type.blockElems().?;
             const bb = ggml_type.blockBytes().?;
             const n_blocks = elems / be;
             const per_expert_elems: u64 = if (dims.len >= 3) dims[0] * dims[1] else elems;
@@ -503,7 +528,7 @@ pub fn dequantToBf16Host(ggml_type: GgmlType, elems: u64, dims: []const u64, raw
                 const block = raw[blk * bb .. (blk + 1) * bb];
                 var tmp: [256]f32 = undefined;
                 try dequantBlock(ggml_type, block, &tmp, gs);
-                for (tmp, 0..) |w, k| {
+                for (tmp[0..be], 0..) |w, k| {
                     std.mem.writeInt(u16, out[(blk * be + k) * 2 ..][0..2], f32ToBf16(w), .little);
                 }
             }

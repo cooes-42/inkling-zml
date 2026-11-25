@@ -11,11 +11,14 @@ pub fn forward(
     layer: inkling2.Layer,
     cfg: inkling2.Config,
 ) zml.Tensor {
-    // logits router {.s, .expert} f32
-    const logits = layer.router.forward(x, .f32).add(layer.router_bias.broad(zml.Shape.init(.{ .s = x.dim(.s), .expert = cfg.n_experts }, .f32)));
-    const routing = logits.topK(.{ .topk = .expert }, cfg.top_k, .{});
+    // routage sigmoïde de llama.cpp : probs = sigmoid(logits) ; topk sur probs + biais ;
+    // poids = probs (NON biaisés) des experts sélectionnés, mis à l'échelle par route_scale.
+    const logits = layer.router.forward(x, .f32); // {.s, .expert}
+    const probs = logits.sigmoid();
+    const sel_probs = probs.add(layer.router_bias.broad(zml.Shape.init(.{ .s = x.dim(.s), .expert = cfg.n_experts }, .f32)));
+    const routing = sel_probs.topK(.{ .topk = .expert }, cfg.top_k, .{});
     const ids = routing.indices.convert(.i32); // {.s, .topk}
-    const scores = routing.values.sigmoid().scale(cfg.route_scale); // {.s, .topk}
+    const scores = probs.gather(.{ .expert = ids }, .{}).scale(cfg.route_scale); // {.s, .topk}
 
     // experts gather (calcul en f32) : gate_up {.expert, .dout, .d} -> {.s, .topk, .dout, .d}
     const gate_up = layer.gate_up_exps.weight.gather(.{ .expert = ids }, .{}).convert(.f32);

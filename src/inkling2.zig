@@ -55,6 +55,14 @@ pub const Config = struct {
         c.n_visits = c.loop_start + (c.loop_end - c.loop_start) * c.loop_count + (c.n_layers_phys - c.loop_end);
         return c;
     }
+
+    /// Override du nombre de passes de boucle (expériences LoopCD / halving).
+    pub fn withLoopCount(self: Config, n: u32) Config {
+        var c = self;
+        c.loop_count = n;
+        c.n_visits = c.loop_start + (c.loop_end - c.loop_start) * c.loop_count + (c.n_layers_phys - c.loop_end);
+        return c;
+    }
 };
 
 /// Visite v (0..n_visits-1) -> couche physique.
