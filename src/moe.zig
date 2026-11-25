@@ -17,13 +17,13 @@ pub fn forward(
     const ids = routing.indices.convert(.i32); // {.s, .topk}
     const scores = routing.values.sigmoid().scale(cfg.route_scale); // {.s, .topk}
 
-    // experts gather: gate_up {.expert, .dout, .d} -> {.s, .topk, .dout, .d}
-    const gate_up = layer.gate_up_exps.weight.gather(.{ .expert = ids }, .{});
-    const down = layer.down_exps.weight.gather(.{ .expert = ids }, .{}); // {.s, .topk, .d, .dout}
+    // experts gather (calcul en f32) : gate_up {.expert, .dout, .d} -> {.s, .topk, .dout, .d}
+    const gate_up = layer.gate_up_exps.weight.gather(.{ .expert = ids }, .{}).convert(.f32);
+    const down = layer.down_exps.weight.gather(.{ .expert = ids }, .{}).convert(.f32); // {.s, .topk, .d, .dout}
 
     // h = gate_up(x) : {.s, .topk, .dout}
-    const x_in = x.insertAxes(.d, .{.topk}).broad(zml.Shape.init(.{ .s = x.dim(.s), .topk = cfg.top_k, .d = x.dim(.d) }, x.dtype()));
-    const h = gate_up.dot(x_in, .d).convert(.f32); // {.s, .topk, .dout}
+    const x_in = x.convert(.f32).insertAxes(.d, .{.topk}).broad(zml.Shape.init(.{ .s = x.dim(.s), .topk = cfg.top_k, .d = x.dim(.d) }, .f32));
+    const h = gate_up.dot(x_in, .d); // {.s, .topk, .dout} f32
 
     // SiTU sur la paire (gate, up) concaténée dans .dout = [gate | up]
     const ff = cfg.ff_exp;
@@ -37,7 +37,7 @@ pub fn forward(
     // down : act {.s, .topk, .dout=ff} x down {.s, .topk, .d, .dout} -> {.s, .topk, .d}
     const out_e = down.dot(act, .dout); // {.s, .topk, .d}
 
-    // pondération par les scores et somme sur topk -> {.s, .d}
+    // pondération par les scores et somme sur topk -> {.s, .d} (sum garde l'axe à 1)
     const weighted = out_e.mul(scores.broad(out_e.shape()));
-    return weighted.sum(.topk).convert(x.dtype());
+    return weighted.sum(.topk).squeeze(.topk).convert(x.dtype());
 }

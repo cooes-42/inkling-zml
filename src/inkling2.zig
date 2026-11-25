@@ -225,9 +225,15 @@ pub const KvCache = struct {
     }
 
     pub fn initBuffer(self: KvCache, io: std.Io, platform: *const zml.Platform) !zml.Bufferized(KvCache) {
+        const zeros_k = try std.heap.smp_allocator.alloc(u8, self.k.shape().byteSize());
+        defer std.heap.smp_allocator.free(zeros_k);
+        @memset(zeros_k, 0);
+        const zeros_v = try std.heap.smp_allocator.alloc(u8, self.v.shape().byteSize());
+        defer std.heap.smp_allocator.free(zeros_v);
+        @memset(zeros_v, 0);
         return .{
-            .k = try zml.Buffer.uninitialized(io, platform, self.k.shape(), .{}),
-            .v = try zml.Buffer.uninitialized(io, platform, self.v.shape(), .{}),
+            .k = try zml.Buffer.fromBytes(io, platform, self.k.shape(), zeros_k),
+            .v = try zml.Buffer.fromBytes(io, platform, self.v.shape(), zeros_v),
             .layer_index = try zml.Buffer.scalar(io, platform, 0, .u32),
         };
     }
@@ -301,8 +307,11 @@ pub const SconvState = struct {
     }
 
     pub fn initBuffer(self: SconvState, io: std.Io, platform: *const zml.Platform) !zml.Bufferized(SconvState) {
+        const zeros = try std.heap.smp_allocator.alloc(u8, self.state.shape().byteSize());
+        defer std.heap.smp_allocator.free(zeros);
+        @memset(zeros, 0);
         return .{
-            .state = try zml.Buffer.uninitialized(io, platform, self.state.shape(), .{}),
+            .state = try zml.Buffer.fromBytes(io, platform, self.state.shape(), zeros),
             .layer_index = try zml.Buffer.scalar(io, platform, 0, .u32),
         };
     }
@@ -355,7 +364,8 @@ pub fn rmsNormW(x: zml.Tensor, w: zml.Tensor, eps: f32) zml.Tensor {
 /// L2-clip : x * min(1, threshold/||x||) sur l'axe donné (inkling2.cpp graph::clip).
 fn l2clip(x: zml.Tensor, threshold: f32, axis: anytype) zml.Tensor {
     const n = x.powByConst(2).sum(axis).sqrt();
-    const s = zml.Tensor.scalar(threshold, .f32).div(n.maximum(zml.Tensor.scalar(threshold, .f32)));
+    const t = zml.Tensor.scalar(threshold, x.dtype());
+    const s = t.div(n.maximum(t));
     return x.mul(s.broad(x.shape()));
 }
 
@@ -404,7 +414,7 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
     // 1. attn_res : mix over depth (blk.0 n'a pas de query)
     var inputs = [3]zml.Tensor{ cur, cur, cur };
     if (L.attn_res_query) |q| {
-        const mixed = depth_mix.mix(ctx.blocks.slice(), cur, q); // {.q, .s, .d}
+        const mixed = depth_mix.mix(ctx.blocks.slice(), cur, q).convert(cur.dtype()); // {.q, .s, .d}
         if (global) {
             for (0..3) |j| inputs[j] = mixed.slice(.q, .{ .start = @intCast(j), .end = @intCast(j + 1) }).squeeze(.q);
         } else {
@@ -417,7 +427,7 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
     if (msgs) |ms| {
         const lc = m.loop_ctrl[phys - cfg.loop_start];
         for (0..3) |j| {
-            const msg = ms.slice(.ctrl, .{ .start = @intCast(j), .end = @intCast(j + 1) }).squeeze(.ctrl);
+            const msg = ms.slice(.q, .{ .start = @intCast(j), .end = @intCast(j + 1) }).squeeze(.q);
             inputs[j] = loop_ctrl_mod.control(inputs[j], msg, lc, j);
         }
     }
@@ -447,8 +457,8 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
         break :blk t.reshape(.{ .s = s, .kernel = cfg.sconv_kernel, .h = hkv });
     } else null;
 
-    const kc = sconv.convolve(Kp, L.k_conv, dyn_k, ctx.sconv, v, SconvState.k_off);
-    const vc = sconv.convolve(Vp, L.v_conv, dyn_v, kc.state, v, SconvState.v_off);
+    const kc = sconv.convolve(Kp, L.k_conv.rename(.{ .d_kv = .c }), dyn_k, ctx.sconv, v, SconvState.k_off);
+    const vc = sconv.convolve(Vp, L.v_conv.rename(.{ .d_kv = .c }), dyn_v, kc.state, v, SconvState.v_off);
     var K = kc.out.splitAxis(.c, .{ .h = hkv, .hd = hd }); // {.s, .h, .hd}
     var V = vc.out.splitAxis(.c, .{ .h = hkv, .hd = hd });
 
@@ -460,8 +470,8 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
     if (global) {
         const tau = ctx.pos.convert(.f32).addConstant(1).scale(1.0 / cfg.log_scale_floor)
             .maximum(zml.Tensor.scalar(1.0, .f32)).log().scale(cfg.log_scale_alpha).addConstant(1); // {.s}
-        Q = Q.mul(tau.broad(Q.shape()));
-        R = R.mul(tau.broad(R.shape()));
+        Q = Q.mul(tau.convert(Q.dtype()).broad(Q.shape()));
+        R = R.mul(tau.convert(R.dtype()).broad(R.shape()));
     }
 
     // 6. KV cache (K/V après sconv + clip/norm) puis biais relatif + sinks
@@ -474,7 +484,7 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
     // pad high de 1 sur .extent (ggml_pad(rel_bias, 0, 1, 0, 0)) : entrée d'indice `extent` = 0
     const zeros_row = zml.Tensor.constant(zml.DataType.f32.zero()).broad(zml.Shape.init(.{ .extent = 1, .d_rel = cfg.d_rel }, L.rel_bias.dtype()));
     const table = zml.Tensor.concatenate(&.{ L.rel_bias, zeros_row }, .extent) // {.extent+1, .d_rel}
-        .dot(R.transpose(.{ .d_rel, .h, .s }), .d_rel) // {.extent+1, .h, .s}
+        .dot(R.transpose(.{ .d_rel, .h, .s }).convert(.f32), .d_rel) // {.extent+1, .h, .s}
         .sub(sinks.broad(zml.Shape.init(.{ .extent = extent + 1, .h = h, .s = s }, .f32))) // {.extent+1, .h, .s}
         .transpose(.{ .h, .extent, .s }); // {.h, .extent+1, .s}
 
@@ -501,7 +511,10 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
         zml.Tensor.constant(zml.DataType.f32.zero()).broad(zml.Shape.init(.{ .q = s, .k = n_kv }, .f32)),
         zml.Tensor.constant(zml.DataType.Value.init(.f32, -std.math.inf(f32))).broad(zml.Shape.init(.{ .q = s, .k = n_kv }, .f32)),
     ); // {.q, .k}
-    const attn_mask = mask.broad(zml.Shape.init(.{ .h = h, .q = s, .k = n_kv }, .f32)).add(kq_b); // {.h, .q, .k}
+    // sdpa splitte q en {h=hkv, hq} : on replie kq_b (par tête Q) en {h=hkv, hq, q, k}
+    const kq_b_h = kq_b.splitAxis(.h, .{ .h = hkv, .hq = @divExact(h, hkv) }); // {.h=hkv, .hq, .q, .k}
+    // sdpa ajoute le masque en bf16 (dtype de q) avant de passer en f32 : on convertit
+    const attn_mask = mask.broad(kq_b_h.shape()).add(kq_b_h).convert(Q.dtype()); // {.h=hkv, .hq, .q, .k}
 
     // 7. attention sdpa : softmax(QK/√hd + mask + kq_b) · V
     const attn = zml.nn.sdpa(
@@ -514,30 +527,31 @@ pub fn forwardVisit(m: Model, v: u32, cur: zml.Tensor, ctx: VisitCtx, msgs: ?zml
     // 8. sortie attention : gate sigmoïde + wo + sconv post
     var a = attn.rename(.{ .q = .s }).transpose(.{ .s, .h, .hd }).merge(.{ .dout = .{ .h, .hd } }); // {.s, .dout=h*hd}
     a = a.mul(L.wqkv_gate.forward(inputs[0], a.dtype()).sigmoid());
-    const ac = sconv.convolve(L.wo.forward(a, a.dtype()), L.attn_post_conv, null, vc.state, v, SconvState.attn_post_off);
+    const wo_out = L.wo.forward(a.rename(.{ .dout = .d }), a.dtype()).rename(.{ .dout = .c }); // {.s, .c=d}
+    const ac = sconv.convolve(wo_out, L.attn_post_conv.rename(.{ .d = .c }), null, vc.state, v, SconvState.attn_post_off);
 
     // 9. residual par bloc de 6
     var cur2: zml.Tensor = undefined;
     if (phys % cfg.attn_res_block == 0) {
         ctx.blocks.append(inpSA);
-        cur2 = ac.out;
+        cur2 = ac.out.rename(.{ .c = .d });
     } else {
-        cur2 = inpSA.add(ac.out);
+        cur2 = inpSA.add(ac.out.rename(.{ .c = .d }));
     }
 
     // 10. FFN MoE
     const ffn_inp = cur2;
-    var f = depth_mix.mix(ctx.blocks.slice(), cur2, L.ffn_res_query).slice(.q, .{ .start = 0, .end = 1 }).squeeze(.q); // {.s, .d}
+    var f = depth_mix.mix(ctx.blocks.slice(), cur2, L.ffn_res_query).slice(.q, .{ .start = 0, .end = 1 }).squeeze(.q).convert(cur2.dtype()); // {.s, .d}
     if (msgs) |ms| {
-        const msg = ms.slice(.ctrl, .{ .start = 3, .end = 4 }).squeeze(.ctrl);
+        const msg = ms.slice(.q, .{ .start = 3, .end = 4 }).squeeze(.q);
         f = loop_ctrl_mod.control(f, msg, m.loop_ctrl[phys - cfg.loop_start], 3);
     }
     f = rmsNormW(f, L.ffn_norm, cfg.rms_eps);
     f = moe.forward(f, L, cfg);
-    const fc = sconv.convolve(f, L.ffn_post_conv, null, ac.state, v, SconvState.ffn_post_off);
+    const fc = sconv.convolve(f.rename(.{ .d = .c }), L.ffn_post_conv.rename(.{ .d = .c }), null, ac.state, v, SconvState.ffn_post_off);
 
     return .{
-        .cur = ffn_inp.add(fc.out),
+        .cur = ffn_inp.add(fc.out.rename(.{ .c = .d })),
         .kv = kv,
         .sconv = fc.state,
     };
@@ -602,7 +616,7 @@ pub fn forward(m: Model, tokens: zml.Tensor, pos: zml.Tensor, token_index: zml.T
             const ip: u32 = cfg.loop_start + i;
             const v: u32 = if (pass == 0) ip else cfg.n_layers_phys + (pass - 1) * core + i;
             const msgs: ?zml.Tensor = if (pass > 0)
-                depth_mix.mix(bank, bank_out, m.loop_ctrl[ip - cfg.loop_start].msg_query) // {.ctrl=4, .s, .d}
+                depth_mix.mix(bank, bank_out, m.loop_ctrl[ip - cfg.loop_start].msg_query.rename(.{ .ctrl = .q })) // {.q=4, .s, .d}
             else
                 null;
             const o = forwardVisit(m, v, cur, ctx, msgs);
@@ -621,11 +635,11 @@ pub fn forward(m: Model, tokens: zml.Tensor, pos: zml.Tensor, token_index: zml.T
     }
 
     // sortie : mix + output_norm + lm_head + softcap + vocab unpadded
-    var out = depth_mix.mix(blocks.slice(), cur, m.output_res_query).slice(.q, .{ .start = 0, .end = 1 }).squeeze(.q); // {.s, .d}
+    var out = depth_mix.mix(blocks.slice(), cur, m.output_res_query).slice(.q, .{ .start = 0, .end = 1 }).squeeze(.q).convert(cur.dtype()); // {.s, .d}
     out = rmsNormW(out, m.output_norm, cfg.rms_eps);
-    var logits = m.output.dot(out, .d); // {.s, .voc}
+    var logits = m.output.dot(out, .d); // {.voc, .s}
     logits = logits.scale(1.0 / cfg.final_softcap).tanh().scale(cfg.final_softcap); // softcap 30
-    logits = logits.slice(.voc, .{ .start = 0, .end = cfg.vocab_unpadded }).convert(.f32);
+    logits = logits.slice(.voc, .{ .start = 0, .end = cfg.vocab_unpadded }).convert(.f32).transpose(.{ .s, .voc }); // {.s, .voc}
 
     return .{ .logits = logits, .kv = ctx.kv, .sconv = ctx.sconv };
 }
@@ -648,13 +662,13 @@ pub fn randomLayer(cfg: Config, idx: u32) Layer {
         .q_inp_norm = if (global) randT(.init(.{ .d = d }, .f32), 1) else null,
         .k_inp_norm = if (global) randT(.init(.{ .d = d }, .f32), 1) else null,
         .v_inp_norm = if (global) randT(.init(.{ .d = d }, .f32), 1) else null,
-        .wq = .init(randT(.init(.{ .dout = cfg.h * cfg.hd, .d = d }, .bf16), 0.05), null, .d),
-        .wk = .init(randT(.init(.{ .dout = cfg.hkv * cfg.hd, .d = d }, .bf16), 0.05), null, .d),
-        .wv = .init(randT(.init(.{ .dout = cfg.hkv * cfg.hd, .d = d }, .bf16), 0.05), null, .d),
-        .wo = .init(randT(.init(.{ .dout = d, .d = cfg.h * cfg.hd }, .bf16), 0.05), null, .d),
-        .wqkv_gate = .init(randT(.init(.{ .dout = cfg.h * cfg.hd, .d = d }, .bf16), 0.05), null, .d),
-        .sink_proj = .init(randT(.init(.{ .dout = cfg.h, .d = d }, .bf16), 0.05), null, .d),
-        .wrel = .init(randT(.init(.{ .dout = cfg.h * cfg.d_rel, .d = d }, .bf16), 0.05), null, .d),
+        .wq = .init(randT(.init(.{ .dout = cfg.h * cfg.hd, .d = d }, .bf16), 0.02), null, .d),
+        .wk = .init(randT(.init(.{ .dout = cfg.hkv * cfg.hd, .d = d }, .bf16), 0.02), null, .d),
+        .wv = .init(randT(.init(.{ .dout = cfg.hkv * cfg.hd, .d = d }, .bf16), 0.02), null, .d),
+        .wo = .init(randT(.init(.{ .dout = d, .d = cfg.h * cfg.hd }, .bf16), 0.02), null, .d),
+        .wqkv_gate = .init(randT(.init(.{ .dout = cfg.h * cfg.hd, .d = d }, .bf16), 0.02), null, .d),
+        .sink_proj = .init(randT(.init(.{ .dout = cfg.h, .d = d }, .bf16), 0.02), null, .d),
+        .wrel = .init(randT(.init(.{ .dout = cfg.h * cfg.d_rel, .d = d }, .bf16), 0.02), null, .d),
         .rel_bias = randT(.init(.{ .extent = extent, .d_rel = cfg.d_rel }, .f32), 0.1),
         .rel_clip = randT(.init(.{ .h = cfg.h, .d_rel = cfg.d_rel }, .f32), 1),
         .q_clip = randT(.init(.{ .h = cfg.h, .hd = cfg.hd }, .f32), 1),
@@ -672,8 +686,8 @@ pub fn randomLayer(cfg: Config, idx: u32) Layer {
         .ffn_norm = randT(.init(.{ .d = d }, .f32), 1),
         .router = .init(randT(.init(.{ .expert = cfg.n_experts, .d = d }, .f32), 0.1), null, .d),
         .router_bias = randT(.init(.{ .expert = cfg.n_experts }, .f32), 0.1),
-        .gate_up_exps = .init(randT(.init(.{ .expert = cfg.n_experts, .dout = 2 * cfg.ff_exp, .d = d }, .bf16), 0.05), null, .d),
-        .down_exps = .init(randT(.init(.{ .expert = cfg.n_experts, .d = d, .dout = cfg.ff_exp }, .bf16), 0.05), null, .dout),
+        .gate_up_exps = .init(randT(.init(.{ .expert = cfg.n_experts, .dout = 2 * cfg.ff_exp, .d = d }, .bf16), 0.02), null, .d),
+        .down_exps = .init(randT(.init(.{ .expert = cfg.n_experts, .d = d, .dout = cfg.ff_exp }, .bf16), 0.02), null, .dout),
     };
 }
 
@@ -704,11 +718,11 @@ pub fn randomModel(cfg: Config) Model {
     }
     return .{
         .config = cfg,
-        .token_embd = randT(.init(.{ .voc = cfg.vocab, .d = cfg.d }, .bf16), 0.05),
+        .token_embd = randT(.init(.{ .voc = cfg.vocab, .d = cfg.d }, .bf16), 0.02),
         .token_embd_norm = randT(.init(.{ .d = cfg.d }, .f32), 1),
         .layers = layers,
         .loop_ctrl = loop_ctrl,
-        .output = randT(.init(.{ .voc = cfg.vocab, .d = cfg.d }, .bf16), 0.05),
+        .output = randT(.init(.{ .voc = cfg.vocab, .d = cfg.d }, .bf16), 0.02),
         .output_norm = randT(.init(.{ .d = cfg.d }, .f32), 1),
         .output_res_query = randT(.init(.{ .d = cfg.d }, .f32), 0.1),
     };

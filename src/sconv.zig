@@ -38,9 +38,9 @@ pub fn convolve(
     var out: zml.Tensor = undefined;
     for (0..@intCast(kernel)) |lag_usize| {
         const lag: i64 = @intCast(lag_usize);
-        const win = x.slice(.t, .{ .start = lag, .end = lag + s }); // {.s, .c}
+        const win = x.slice(.t, .{ .start = lag, .end = lag + s }).rename(.{ .t = .s }); // {.s, .c}
         const w = weight.slice(.kernel, .{ .start = lag, .end = lag + 1 }).squeeze(.kernel)
-            .rename(.{ .d_kv = .c }).convert(cur.dtype()); // {.c}
+            .convert(cur.dtype()); // {.c} (le poids est renommé .c par l'appelant)
         const term = win.mul(w.broad(win.shape()));
         out = if (lag == 0) term else out.add(term);
     }
@@ -50,8 +50,8 @@ pub fn convolve(
         const heads = dyn.dim(.h);
         for (0..@intCast(kernel)) |lag_usize| {
             const lag: i64 = @intCast(lag_usize);
-            const win = x.slice(.t, .{ .start = kernel - 1 - lag, .end = kernel - 1 - lag + s }); // {.s, .c}
-            const tap = dyn.slice(.kernel, .{ .start = lag, .end = lag + 1 }).squeeze(.kernel); // {.s, .h}
+            const win = x.slice(.t, .{ .start = kernel - 1 - lag, .end = kernel - 1 - lag + s }).rename(.{ .t = .s }); // {.s, .c}
+            const tap = dyn.slice(.kernel, .{ .start = lag, .end = lag + 1 }).squeeze(.kernel).convert(cur.dtype()); // {.s, .h}
             // window {c/heads, heads, s} * tap {s, h}
             const w = win.transpose(.{ .c, .s }).splitAxis(.c, .{ .ch = @divExact(c, heads), .h = heads }); // {.ch, .h, .s}
             const term = w.mul(tap.transpose(.{ .h, .s }).broad(w.shape())).merge(.{ .c = .{ .ch, .h } }); // {.c, .s}
